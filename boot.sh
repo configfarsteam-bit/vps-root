@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 #
 # =====================================================================
-#  👹 DXD LABS PREMIUM VPS DASHBOARD — SUKUNA V4
+#  👹 DXD LABS PREMIUM VPS DASHBOARD — SUKUNA V4.1
 # =====================================================================
-#  Production-oriented Ubuntu 22.04 QEMU/KVM VM manager
+#  Hardened Ubuntu 22.04 QEMU/KVM VM Manager
 #
-#  Features:
-#    • Real KVM detection + automatic TCG fallback
-#    • Direct QEMU VM console (-nographic)
-#    • Base cloud image + independent qcow2 overlay
-#    • Automatic CPU/RAM/resource detection
-#    • Persistent secure configuration
-#    • PID + lock based VM state management
-#    • QMP based graceful shutdown
-#    • Safe TCP host -> guest forwarding
-#    • Cloud-init provisioning
-#    • Dedicated VM logs
-#    • Disk management
-#    • Input validation
-#    • Error handling
+#  FIXES:
+#    • QEMU missing-path bug fixed
+#    • Dependencies installed before binary detection
+#    • Automatic VM artifact preparation
+#    • Automatic base image download
+#    • Automatic qcow2 disk creation
+#    • Automatic cloud-init seed creation
+#    • Real Direct Console using -nographic
+#    • QEMU stderr logged without stealing console stdout
+#    • Correct architecture-specific QEMU selection
+#    • KVM + TCG fallback
+#    • PID + QMP + lock management
+#    • Graceful shutdown
+#    • Port validation
+#    • Persistent configuration
+#    • SHA256 image verification
 #
 #  Target:
-#    Ubuntu / Debian based hosts
+#    Ubuntu / Debian
 #    Ubuntu 22.04 cloud image
 #
 # =====================================================================
@@ -33,8 +35,8 @@ IFS=$'\n\t'
 # VERSION
 # =====================================================================
 
-readonly APP_NAME="DXD LABS PREMIUM VPS DASHBOARD — SUKUNA V4"
-readonly VERSION="4.0.0"
+readonly APP_NAME="DXD LABS PREMIUM VPS DASHBOARD — SUKUNA V4.1"
+readonly VERSION="4.1.0"
 
 # =====================================================================
 # COLORS
@@ -76,13 +78,11 @@ readonly QMP_SOCKET="${RUN_DIR}/${VM_NAME}.qmp"
 readonly LOCK_FILE="${RUN_DIR}/${VM_NAME}.lock"
 
 readonly QEMU_LOG="${LOG_DIR}/qemu.log"
-readonly CLOUD_INIT_LOG="${LOG_DIR}/cloud-init.log"
 
 readonly CLOUDIMG_URL_AMD64="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
-readonly CLOUDIMG_SHA_AMD64="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
-
 readonly CLOUDIMG_URL_ARM64="https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-arm64.img"
-readonly CLOUDIMG_SHA_ARM64="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
+
+readonly CLOUDIMG_SHA="https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS"
 
 # =====================================================================
 # GLOBALS
@@ -92,14 +92,13 @@ SUDO_CMD=""
 PKG_MANAGER=""
 ARCH=""
 QEMU_BIN=""
-CLOUD_LOCALDS_BIN=""
 SOCAT_BIN=""
 
-CPU_HOST=0
-CPU_VM=0
+CPU_HOST=1
+CPU_VM=1
 
-RAM_HOST_MB=0
-RAM_VM_MB=0
+RAM_HOST_MB=1024
+RAM_VM_MB=512
 
 DISK_SIZE_GB=20
 
@@ -125,12 +124,13 @@ on_error() {
 
     echo
     echo -e "${RED}============================================================${NC}"
-    echo -e "${RED}❌ SUKUNA V4 ERROR${NC}"
+    echo -e "${RED}❌ SUKUNA V4.1 ERROR${NC}"
     echo -e "${RED}============================================================${NC}"
     echo -e "${WHITE}Line:${NC} ${line_no}"
     echo -e "${WHITE}Exit:${NC} ${exit_code}"
     echo -e "${WHITE}Log :${NC} ${QEMU_LOG}"
     echo -e "${RED}============================================================${NC}"
+    echo
 
     exit "$exit_code"
 }
@@ -138,8 +138,6 @@ on_error() {
 trap 'on_error $LINENO' ERR
 
 cleanup_on_exit() {
-    # Do not kill the VM automatically.
-    # The dashboard may exit while QEMU is still running.
     :
 }
 
@@ -152,15 +150,16 @@ trap cleanup_on_exit EXIT
 setup_privileges() {
     if [[ "$(id -u)" -eq 0 ]]; then
         SUDO_CMD=""
-        return
+        return 0
     fi
 
     if command -v sudo >/dev/null 2>&1; then
         SUDO_CMD="sudo"
-    else
-        echo -e "${RED}❌ sudo is required when not running as root.${NC}"
-        exit 1
+        return 0
     fi
+
+    echo -e "${RED}❌ sudo is required when not running as root.${NC}"
+    exit 1
 }
 
 # =====================================================================
@@ -177,7 +176,7 @@ header() {
 
     echo -e "${RED}╔════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${RED}║${NC}        ${WHITE}👹 DXD LABS PREMIUM VPS DASHBOARD${NC}          ${RED}║${NC}"
-    echo -e "${RED}║${NC}                  ${CYAN}SUKUNA V4${NC}                          ${RED}║${NC}"
+    echo -e "${RED}║${NC}                 ${CYAN}SUKUNA V4.1${NC}                        ${RED}║${NC}"
     echo -e "${RED}╠════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${RED}║${NC} ${DIM}QEMU/KVM • Ubuntu 22.04 • VM Manager • Direct Console${NC} ${RED}║${NC}"
     echo -e "${RED}╚════════════════════════════════════════════════════════════╝${NC}"
@@ -201,16 +200,13 @@ error_msg() {
 }
 
 # =====================================================================
-# COMMAND CHECKS
+# COMMAND CHECK
 # =====================================================================
 
 require_command() {
     local cmd="$1"
 
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        error_msg "Required command not found: $cmd"
-        return 1
-    fi
+    command -v "$cmd" >/dev/null 2>&1
 }
 
 # =====================================================================
@@ -223,26 +219,87 @@ detect_package_manager() {
     elif command -v apt >/dev/null 2>&1; then
         PKG_MANAGER="apt"
     else
-        error_msg "No supported Debian/Ubuntu package manager found."
+        error_msg "Unsupported package manager."
         return 1
     fi
 }
 
+# =====================================================================
+# ARCHITECTURE
+# =====================================================================
+
+detect_architecture() {
+    local machine
+
+    machine="$(uname -m)"
+
+    case "$machine" in
+        x86_64|amd64)
+            ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            ARCH="arm64"
+            ;;
+        *)
+            error_msg "Unsupported host architecture: ${machine}"
+            return 1
+            ;;
+    esac
+}
+
+# =====================================================================
+# QEMU BINARY
+# =====================================================================
+
+resolve_qemu_binary() {
+    QEMU_BIN=""
+
+    case "$ARCH" in
+        amd64)
+            if command -v qemu-system-x86_64 >/dev/null 2>&1; then
+                QEMU_BIN="$(command -v qemu-system-x86_64)"
+            fi
+            ;;
+        arm64)
+            if command -v qemu-system-aarch64 >/dev/null 2>&1; then
+                QEMU_BIN="$(command -v qemu-system-aarch64)"
+            fi
+            ;;
+    esac
+
+    if [[ -z "$QEMU_BIN" ]]; then
+        error_msg "QEMU binary for ${ARCH} was not found."
+        return 1
+    fi
+
+    success "QEMU detected: ${QEMU_BIN}"
+}
+
+# =====================================================================
+# DEPENDENCIES
+# =====================================================================
+
 install_dependencies() {
     detect_package_manager
+    detect_architecture
 
     local packages=(
-        qemu-system-x86
         qemu-utils
         cloud-image-utils
         curl
-        wget
         openssl
         util-linux
         socat
+        ca-certificates
     )
 
-    echo -e "${YELLOW}📦 Checking required packages...${NC}"
+    if [[ "$ARCH" == "amd64" ]]; then
+        packages+=("qemu-system-x86")
+    else
+        packages+=("qemu-system-arm")
+    fi
+
+    echo -e "${YELLOW}📦 Checking dependencies...${NC}"
 
     local missing=()
 
@@ -258,236 +315,102 @@ install_dependencies() {
         return 0
     fi
 
-    echo -e "${YELLOW}Installing:${NC} ${missing[*]}"
+    echo
+    echo -e "${YELLOW}Installing missing packages:${NC}"
+    printf '  %s\n' "${missing[@]}"
+    echo
 
     $SUDO_CMD "$PKG_MANAGER" update -y
     $SUDO_CMD "$PKG_MANAGER" install -y "${missing[@]}"
+
+    success "Dependencies installed."
 }
 
 # =====================================================================
-# ARCHITECTURE
-# =====================================================================
-
-detect_architecture() {
-    ARCH="$(uname -m)"
-
-    case "$ARCH" in
-        x86_64|amd64)
-            ARCH="amd64"
-            QEMU_BIN="$(command -v qemu-system-x86_64)"
-            ;;
-        aarch64|arm64)
-            ARCH="arm64"
-
-            if command -v qemu-system-aarch64 >/dev/null 2>&1; then
-                QEMU_BIN="$(command -v qemu-system-aarch64)"
-            else
-                error_msg "qemu-system-aarch64 is not installed."
-                return 1
-            fi
-            ;;
-        *)
-            error_msg "Unsupported host architecture: $ARCH"
-            return 1
-            ;;
-    esac
-}
-
-# =====================================================================
-# KVM DETECTION
+# KVM
 # =====================================================================
 
 detect_kvm() {
     KVM_AVAILABLE=false
     KVM_REASON=""
 
+    if [[ "$ARCH" != "amd64" ]]; then
+        KVM_REASON="ARM KVM path is not enabled by this VM profile."
+        return 0
+    fi
+
     if [[ ! -e /dev/kvm ]]; then
-        KVM_REASON="/dev/kvm does not exist"
+        KVM_REASON="/dev/kvm does not exist."
         return 0
     fi
 
     if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
-        KVM_REASON="/dev/kvm exists but is not readable/writable"
+        KVM_REASON="/dev/kvm is not readable/writable."
         return 0
     fi
 
-    if [[ "$ARCH" != "amd64" ]]; then
-        KVM_REASON="ARM KVM requires architecture-specific QEMU configuration"
-        return 0
-    fi
-
-    if ! "$SUDO_CMD" test -r /dev/kvm; then
-        KVM_REASON="Permission denied for /dev/kvm"
+    if ! $SUDO_CMD test -r /dev/kvm 2>/dev/null; then
+        KVM_REASON="Permission denied for /dev/kvm."
         return 0
     fi
 
     KVM_AVAILABLE=true
-    KVM_REASON="Hardware acceleration available"
+    KVM_REASON="Hardware acceleration available."
 }
 
 # =====================================================================
-# RESOURCE DETECTION
+# RESOURCES
 # =====================================================================
 
 detect_resources() {
-    CPU_HOST="$(nproc 2>/dev/null || true)"
+    CPU_HOST="$(nproc 2>/dev/null || echo 1)"
 
-    if [[ "$CPU_HOST" -lt 1 ]]; then
+    if (( CPU_HOST < 1 )); then
         CPU_HOST=1
     fi
 
-    # Keep at least one host CPU.
-    if [[ "$CPU_HOST" -le 2 ]]; then
+    if (( CPU_HOST <= 2 )); then
         CPU_VM=1
     else
         CPU_VM=$((CPU_HOST - 1))
     fi
 
-    # Prevent unreasonable allocations.
-    if [[ "$CPU_VM" -lt 1 ]]; then
-        CPU_VM=1
-    fi
-
     local mem_kb
-    mem_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+
+    mem_kb="$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo)"
+
+    if [[ -z "$mem_kb" ]]; then
+        error_msg "Unable to detect host RAM."
+        return 1
+    fi
 
     RAM_HOST_MB=$((mem_kb / 1024))
 
-    if [[ "$RAM_HOST_MB" -lt 1024 ]]; then
+    if (( RAM_HOST_MB < 1024 )); then
         error_msg "Host RAM is too low: ${RAM_HOST_MB}MB"
         return 1
     fi
 
-    # Reserve at least 1GB or ~20%, whichever is larger.
     local reserve_mb
+
     reserve_mb=$((RAM_HOST_MB / 5))
 
-    if [[ "$reserve_mb" -lt 1024 ]]; then
+    if (( reserve_mb < 1024 )); then
         reserve_mb=1024
     fi
 
     RAM_VM_MB=$((RAM_HOST_MB - reserve_mb))
 
-    # Never allocate less than 512MB.
-    if [[ "$RAM_VM_MB" -lt 512 ]]; then
-        error_msg "Not enough RAM available for a VM."
+    if (( RAM_VM_MB < 512 )); then
+        error_msg "Not enough RAM available for VM."
         return 1
     fi
 
-    # Round down to 128MB.
     RAM_VM_MB=$((RAM_VM_MB / 128 * 128))
 
-    # Disk space.
-    local free_kb
-    free_kb="$(df -Pk "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}')"
-
-    if [[ -z "$free_kb" ]]; then
-        free_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+    if (( RAM_VM_MB < 512 )); then
+        RAM_VM_MB=512
     fi
-
-    local free_gb=$((free_kb / 1024 / 1024))
-
-    if [[ "$free_gb" -lt 5 ]]; then
-        warning "Less than 5GB free disk space detected."
-    fi
-}
-
-# =====================================================================
-# CONFIG
-# =====================================================================
-
-validate_number() {
-    local value="$1"
-    local min="$2"
-    local max="$3"
-
-    [[ "$value" =~ ^[0-9]+$ ]] || return 1
-    (( value >= min && value <= max ))
-}
-
-validate_port() {
-    local port="$1"
-    validate_number "$port" 1 65535
-}
-
-validate_disk_size() {
-    local size="$1"
-    validate_number "$size" 5 4096
-}
-
-write_config() {
-    $SUDO_CMD mkdir -p "$CONFIG_DIR"
-
-    cat > /tmp/sukuna_v4_config.$$ <<EOF
-# SUKUNA V4 persistent configuration
-VM_NAME="${VM_NAME}"
-VM_HOSTNAME="${VM_HOSTNAME}"
-RAM_MB="${RAM_VM_MB}"
-CPU_CORES="${CPU_VM}"
-DISK_SIZE_GB="${DISK_SIZE_GB}"
-HOST_PORT="${HOST_PORT}"
-GUEST_PORT="${GUEST_PORT}"
-BASE_IMAGE="${BASE_IMAGE}"
-VM_IMAGE="${VM_IMAGE}"
-EOF
-
-    $SUDO_CMD install -m 600 \
-        /tmp/sukuna_v4_config.$$ \
-        "$CONFIG_FILE"
-
-    rm -f /tmp/sukuna_v4_config.$$
-}
-
-load_config() {
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        return 1
-    fi
-
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-
-    CPU_VM="${CPU_CORES:-$CPU_VM}"
-    RAM_VM_MB="${RAM_MB:-$RAM_VM_MB}"
-    DISK_SIZE_GB="${DISK_SIZE_GB:-20}"
-    HOST_PORT="${HOST_PORT:-2222}"
-    GUEST_PORT="${GUEST_PORT:-22}"
-    VM_HOSTNAME="${VM_HOSTNAME:-$VM_NAME}"
-}
-
-# =====================================================================
-# PASSWORD
-# =====================================================================
-
-generate_password_hash() {
-    local password="$1"
-
-    if [[ -z "$password" ]]; then
-        error_msg "Password cannot be empty."
-        return 1
-    fi
-
-    ROOT_PASSWORD_HASH="$(openssl passwd -6 "$password")"
-}
-
-# =====================================================================
-# PORT CHECK
-# =====================================================================
-
-port_is_free() {
-    local port="$1"
-
-    if ! validate_port "$port"; then
-        return 1
-    fi
-
-    if command -v ss >/dev/null 2>&1; then
-        if ss -H -ltn 2>/dev/null | awk '{print $4}' | \
-            grep -Eq "(^|:)$port$"; then
-            return 1
-        fi
-    fi
-
-    return 0
 }
 
 # =====================================================================
@@ -510,10 +433,104 @@ prepare_workspace() {
         "$CONFIG_DIR" \
         "$LOG_DIR" \
         "$RUN_DIR"
+
+    $SUDO_CMD touch "$QEMU_LOG"
+    $SUDO_CMD chmod 600 "$QEMU_LOG"
 }
 
 # =====================================================================
-# CLOUD IMAGE
+# CONFIG
+# =====================================================================
+
+validate_number() {
+    local value="$1"
+    local min="$2"
+    local max="$3"
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    (( value >= min && value <= max ))
+}
+
+validate_port() {
+    validate_number "$1" 1 65535
+}
+
+validate_disk_size() {
+    validate_number "$1" 5 4096
+}
+
+write_config() {
+    $SUDO_CMD mkdir -p "$CONFIG_DIR"
+
+    local tmp_config
+    tmp_config="$(mktemp)"
+
+    cat > "$tmp_config" <<EOF
+VM_NAME="${VM_NAME}"
+VM_HOSTNAME="${VM_HOSTNAME}"
+RAM_MB="${RAM_VM_MB}"
+CPU_CORES="${CPU_VM}"
+DISK_SIZE_GB="${DISK_SIZE_GB}"
+HOST_PORT="${HOST_PORT}"
+GUEST_PORT="${GUEST_PORT}"
+EOF
+
+    $SUDO_CMD install -m 600 "$tmp_config" "$CONFIG_FILE"
+
+    rm -f "$tmp_config"
+}
+
+load_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    CPU_VM="${CPU_CORES:-$CPU_VM}"
+    RAM_VM_MB="${RAM_MB:-$RAM_VM_MB}"
+    DISK_SIZE_GB="${DISK_SIZE_GB:-20}"
+    HOST_PORT="${HOST_PORT:-2222}"
+    GUEST_PORT="${GUEST_PORT:-22}"
+    VM_HOSTNAME="${VM_HOSTNAME:-$VM_NAME}"
+}
+
+# =====================================================================
+# PORT
+# =====================================================================
+
+port_is_free() {
+    local port="$1"
+
+    validate_port "$port" || return 1
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -H -ltn 2>/dev/null |
+            awk '{print $4}' |
+            grep -Eq "([.:])${port}$"; then
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# =====================================================================
+# PASSWORD
+# =====================================================================
+
+generate_password_hash() {
+    local password="$1"
+
+    [[ -n "$password" ]] || {
+        error_msg "Password cannot be empty."
+        return 1
+    }
+
+    ROOT_PASSWORD_HASH="$(openssl passwd -6 "$password")"
+}
+
+# =====================================================================
+# BASE IMAGE
 # =====================================================================
 
 download_base_image() {
@@ -523,18 +540,18 @@ download_base_image() {
     fi
 
     local url
-    local checksum_url
     local image_name
 
-    if [[ "$ARCH" == "amd64" ]]; then
-        url="$CLOUDIMG_URL_AMD64"
-        checksum_url="$CLOUDIMG_SHA_AMD64"
-        image_name="jammy-server-cloudimg-amd64.img"
-    else
-        url="$CLOUDIMG_URL_ARM64"
-        checksum_url="$CLOUDIMG_SHA_ARM64"
-        image_name="jammy-server-cloudimg-arm64.img"
-    fi
+    case "$ARCH" in
+        amd64)
+            url="$CLOUDIMG_URL_AMD64"
+            image_name="jammy-server-cloudimg-amd64.img"
+            ;;
+        arm64)
+            url="$CLOUDIMG_URL_ARM64"
+            image_name="jammy-server-cloudimg-arm64.img"
+            ;;
+    esac
 
     local tmp_image="${BASE_IMAGE}.download"
     local checksum_file="${BASE_DIR}/SHA256SUMS"
@@ -554,31 +571,40 @@ download_base_image() {
         --retry 5 \
         --retry-delay 2 \
         --connect-timeout 15 \
-        "$checksum_url" \
+        "$CLOUDIMG_SHA" \
         -o "$checksum_file"
 
     local expected
-    expected="$(awk -v file="$image_name" '$2 == file || $2 == "*" file {print $1}' "$checksum_file" | head -n1)"
+
+    expected="$(
+        awk -v file="$image_name" '
+            $2 == file || $2 == "*" file {
+                print $1
+                exit
+            }
+        ' "$checksum_file"
+    )"
 
     if [[ -z "$expected" ]]; then
         rm -f "$tmp_image"
-        error_msg "Could not find checksum for downloaded image."
+        error_msg "Checksum for image was not found."
         return 1
     fi
 
     local actual
+
     actual="$(sha256sum "$tmp_image" | awk '{print $1}')"
 
     if [[ "$actual" != "$expected" ]]; then
         rm -f "$tmp_image"
-        error_msg "Ubuntu image checksum verification FAILED."
+        error_msg "SHA256 verification FAILED."
         return 1
     fi
 
     $SUDO_CMD mv "$tmp_image" "$BASE_IMAGE"
     $SUDO_CMD chmod 600 "$BASE_IMAGE"
 
-    success "Ubuntu cloud image verified and stored."
+    success "Ubuntu image downloaded and verified."
 }
 
 # =====================================================================
@@ -591,106 +617,42 @@ create_vm_disk() {
         return 0
     fi
 
-    if [[ ! -f "$BASE_IMAGE" ]]; then
+    [[ -f "$BASE_IMAGE" ]] || {
         error_msg "Base image is missing."
         return 1
-    fi
+    }
 
-    echo -e "${YELLOW}💾 Creating independent qcow2 VM disk...${NC}"
+    echo -e "${YELLOW}💾 Creating qcow2 VM disk...${NC}"
 
     $SUDO_CMD qemu-img create \
         -f qcow2 \
         -F qcow2 \
         -b "$BASE_IMAGE" \
         "$VM_IMAGE" \
-        "$DISK_SIZE_GB"G
+        "${DISK_SIZE_GB}G"
 
     $SUDO_CMD chmod 600 "$VM_IMAGE"
 
-    success "VM disk created."
-}
-
-inspect_disk() {
-    if [[ ! -f "$VM_IMAGE" ]]; then
-        error_msg "VM disk does not exist."
-        return 1
-    fi
-
-    echo
-    $SUDO_CMD qemu-img info "$VM_IMAGE"
-    echo
-}
-
-resize_vm_disk() {
-    if vm_is_running; then
-        error_msg "Stop the VM before resizing the disk."
-        return 1
-    fi
-
-    if [[ ! -f "$VM_IMAGE" ]]; then
-        error_msg "VM disk does not exist."
-        return 1
-    fi
-
-    inspect_disk
-
-    echo -ne "${CYAN}New absolute disk size in GB [5-4096]: ${NC}"
-    read -r new_size
-
-    if ! validate_disk_size "$new_size"; then
-        error_msg "Invalid disk size."
-        return 1
-    fi
-
-    local current_bytes
-    current_bytes="$(
-        qemu-img info --output=json "$VM_IMAGE" |
-            awk -F: '/"virtual-size"/ {gsub(/[, ]/,"",$2); print $2; exit}'
-    )"
-
-    if [[ -z "$current_bytes" ]]; then
-        error_msg "Unable to determine current disk size."
-        return 1
-    fi
-
-    local current_gb=$((current_bytes / 1024 / 1024 / 1024))
-
-    if (( new_size < current_gb )); then
-        error_msg "Shrinking qcow2 disks is intentionally disabled."
-        echo "Current: ${current_gb}G"
-        echo "Requested: ${new_size}G"
-        return 1
-    fi
-
-    if (( new_size == current_gb )); then
-        success "Disk is already ${new_size}G."
-        return 0
-    fi
-
-    echo -e "${YELLOW}Resizing disk: ${current_gb}G -> ${new_size}G${NC}"
-
-    $SUDO_CMD qemu-img resize \
-        "$VM_IMAGE" \
-        "${new_size}G"
-
-    DISK_SIZE_GB="$new_size"
-
-    write_config
-
-    success "Disk resized successfully."
+    success "VM disk created: ${VM_IMAGE}"
 }
 
 # =====================================================================
-# CLOUD-INIT
+# CLOUD INIT
 # =====================================================================
 
 generate_cloud_init() {
-    if [[ -z "$ROOT_PASSWORD_HASH" ]]; then
-        error_msg "Root password hash is not configured."
+    [[ -n "$ROOT_PASSWORD_HASH" ]] || {
+        error_msg "Root password hash is missing."
         return 1
-    fi
+    }
 
-    cat > /tmp/sukuna_user_data.$$ <<EOF
+    local tmp_user_data
+    local tmp_meta_data
+
+    tmp_user_data="$(mktemp)"
+    tmp_meta_data="$(mktemp)"
+
+    cat > "$tmp_user_data" <<EOF
 #cloud-config
 
 hostname: ${VM_HOSTNAME}
@@ -702,7 +664,6 @@ users:
     shell: /bin/bash
 
 disable_root: false
-
 ssh_pwauth: true
 
 chpasswd:
@@ -720,6 +681,7 @@ write_files:
 package_update: true
 
 packages:
+  - openssh-server
   - curl
   - wget
   - git
@@ -730,7 +692,6 @@ packages:
   - sudo
   - net-tools
   - iproute2
-  - openssh-server
 
 growpart:
   mode: auto
@@ -744,28 +705,26 @@ runcmd:
   - [ systemctl, enable, ssh ]
   - [ systemctl, restart, ssh ]
 
-final_message: "SUKUNA V4 Ubuntu VM initialization completed."
+final_message: "SUKUNA V4.1 VM initialization completed."
 EOF
 
-    $SUDO_CMD install -m 600 \
-        /tmp/sukuna_user_data.$$ \
-        "$USER_DATA"
-
-    rm -f /tmp/sukuna_user_data.$$
-
-    cat > /tmp/sukuna_meta_data.$$ <<EOF
+    cat > "$tmp_meta_data" <<EOF
 instance-id: ${VM_NAME}-$(date +%s)
 local-hostname: ${VM_HOSTNAME}
 EOF
 
     $SUDO_CMD install -m 600 \
-        /tmp/sukuna_meta_data.$$ \
+        "$tmp_user_data" \
+        "$USER_DATA"
+
+    $SUDO_CMD install -m 600 \
+        "$tmp_meta_data" \
         "$META_DATA"
 
-    rm -f /tmp/sukuna_meta_data.$$
+    rm -f "$tmp_user_data" "$tmp_meta_data"
 
     if ! command -v cloud-localds >/dev/null 2>&1; then
-        error_msg "cloud-localds is not installed."
+        error_msg "cloud-localds is missing."
         return 1
     fi
 
@@ -778,15 +737,49 @@ EOF
 
     $SUDO_CMD chmod 600 "$SEED_IMAGE"
 
-    success "Cloud-init seed generated."
+    success "Cloud-init seed created."
 }
 
 # =====================================================================
-# VM LOCK
+# VM READY CHECK
+# =====================================================================
+
+vm_artifacts_ready() {
+    [[ -f "$VM_IMAGE" ]] &&
+    [[ -f "$SEED_IMAGE" ]]
+}
+
+prepare_vm_artifacts() {
+    prepare_workspace
+    install_dependencies
+    resolve_qemu_binary
+
+    if [[ -z "$SOCAT_BIN" ]]; then
+        SOCAT_BIN="$(command -v socat || true)"
+    fi
+
+    [[ -n "$SOCAT_BIN" ]] || {
+        error_msg "socat was not found."
+        return 1
+    }
+
+    download_base_image
+    create_vm_disk
+
+    if [[ ! -f "$SEED_IMAGE" ]]; then
+        return 2
+    fi
+
+    return 0
+}
+
+# =====================================================================
+# LOCK
 # =====================================================================
 
 acquire_vm_lock() {
     if [[ -e "$LOCK_FILE" ]]; then
+
         if vm_is_running; then
             error_msg "VM is already running."
             return 1
@@ -799,7 +792,7 @@ acquire_vm_lock() {
         set -o noclobber
         echo "$$" > "$LOCK_FILE"
     ) 2>/dev/null || {
-        error_msg "Could not acquire VM lock."
+        error_msg "Unable to acquire VM lock."
         return 1
     }
 
@@ -828,12 +821,16 @@ vm_is_running() {
     fi
 
     local pid
+
     pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 
-    if [[ -n "$pid" ]] && vm_pid_is_valid "$pid"; then
+    if [[ -n "$pid" ]] &&
+       vm_pid_is_valid "$pid"; then
+
         if [[ -r "/proc/$pid/cmdline" ]] &&
-            tr '\0' ' ' < "/proc/$pid/cmdline" |
-            grep -q "qemu-system"; then
+           tr '\0' ' ' < "/proc/$pid/cmdline" |
+           grep -q "qemu-system"; then
+
             VM_RUNNING=true
             return 0
         fi
@@ -852,10 +849,10 @@ vm_is_running() {
 qmp_command() {
     local command_json="$1"
 
-    if [[ ! -S "$QMP_SOCKET" ]]; then
-        error_msg "QMP socket is unavailable."
+    [[ -S "$QMP_SOCKET" ]] || {
+        error_msg "QMP socket unavailable."
         return 1
-    fi
+    }
 
     printf '%s\n' \
         '{"execute":"qmp_capabilities"}' \
@@ -865,24 +862,30 @@ qmp_command() {
         >/dev/null 2>&1
 }
 
+# =====================================================================
+# STOP
+# =====================================================================
+
 graceful_shutdown() {
     if ! vm_is_running; then
         warning "VM is not running."
         return 0
     fi
 
-    echo -e "${YELLOW}🛑 Requesting graceful VM shutdown...${NC}"
+    echo -e "${YELLOW}🛑 Requesting graceful shutdown...${NC}"
 
-    if ! qmp_command '{"execute":"system_powerdown"}'; then
-        warning "QMP shutdown request failed."
-    fi
+    qmp_command '{"execute":"system_powerdown"}' || true
 
     local timeout=30
 
     while (( timeout > 0 )); do
+
         if ! vm_is_running; then
             success "VM shut down gracefully."
-            rm -f "$QMP_SOCKET"
+
+            rm -f "$QMP_SOCKET" "$PID_FILE"
+            release_vm_lock
+
             return 0
         fi
 
@@ -890,7 +893,8 @@ graceful_shutdown() {
         ((timeout--))
     done
 
-    warning "VM did not shut down within ${30}s."
+    warning "VM did not shut down within 30 seconds."
+
     return 1
 }
 
@@ -901,15 +905,17 @@ force_stop_vm() {
     fi
 
     local pid
+
     pid="$(cat "$PID_FILE")"
 
-    warning "Sending SIGTERM to QEMU PID ${pid}..."
+    echo -e "${YELLOW}Sending SIGTERM to QEMU PID ${pid}...${NC}"
 
     kill -TERM "$pid" 2>/dev/null || true
 
     local timeout=10
 
     while (( timeout > 0 )); do
+
         if ! vm_pid_is_valid "$pid"; then
             break
         fi
@@ -919,13 +925,16 @@ force_stop_vm() {
     done
 
     if vm_pid_is_valid "$pid"; then
-        warning "QEMU did not exit after SIGTERM."
-        echo -e "${YELLOW}Sending SIGKILL to QEMU PID ${pid}...${NC}"
+        warning "QEMU still running. Sending SIGKILL..."
 
         kill -KILL "$pid" 2>/dev/null || true
     fi
 
-    rm -f "$PID_FILE" "$QMP_SOCKET"
+    rm -f \
+        "$PID_FILE" \
+        "$QMP_SOCKET"
+
+    release_vm_lock
 
     success "VM process stopped."
 }
@@ -933,11 +942,11 @@ force_stop_vm() {
 stop_vm() {
     if ! vm_is_running; then
         success "VM is not running."
+        release_vm_lock
         return 0
     fi
 
     if graceful_shutdown; then
-        release_vm_lock
         return 0
     fi
 
@@ -948,7 +957,6 @@ stop_vm() {
     case "$answer" in
         y|Y|yes|YES)
             force_stop_vm
-            release_vm_lock
             ;;
         *)
             warning "VM remains running."
@@ -957,13 +965,14 @@ stop_vm() {
 }
 
 # =====================================================================
-# QEMU COMMAND
+# QEMU ARGS
 # =====================================================================
 
 build_qemu_args() {
     QEMU_ARGS=()
 
     if [[ "$ARCH" == "amd64" ]]; then
+
         if [[ "$KVM_AVAILABLE" == true ]]; then
             QEMU_ARGS+=(
                 "-enable-kvm"
@@ -983,13 +992,16 @@ build_qemu_args() {
             "-machine"
             "q35"
         )
+
     else
+
         QEMU_ARGS+=(
             "-machine"
             "virt"
             "-cpu"
             "max"
         )
+
     fi
 
     QEMU_ARGS+=(
@@ -1014,11 +1026,7 @@ build_qemu_args() {
         "-device"
         "virtio-net-pci,netdev=net0"
 
-        "-display"
-        "none"
-
-        "-serial"
-        "stdio"
+        "-nographic"
 
         "-qmp"
         "unix:${QMP_SOCKET},server=on,wait=off"
@@ -1031,39 +1039,109 @@ build_qemu_args() {
 }
 
 # =====================================================================
-# BOOT VM
+# BOOT
 # =====================================================================
 
 boot_vm() {
     header
 
+    prepare_workspace
+
     if vm_is_running; then
         error_msg "VM is already running."
         pause_screen
-        return
+        return 1
     fi
 
+    detect_architecture
+    detect_kvm
+    detect_resources
+
+    resolve_qemu_binary
+
+    if [[ -z "$SOCAT_BIN" ]]; then
+        SOCAT_BIN="$(command -v socat || true)"
+    fi
+
+    #
+    # IMPORTANT:
+    # Automatically prepare missing VM components.
+    #
+    if [[ ! -f "$BASE_IMAGE" || ! -f "$VM_IMAGE" ]]; then
+
+        echo -e "${YELLOW}⚙ VM disk/base image is incomplete.${NC}"
+        echo -e "${CYAN}SUKUNA will prepare the VM automatically.${NC}"
+        echo
+
+        prepare_vm_artifacts
+
+        #
+        # We cannot generate a seed without a password.
+        #
+        if [[ ! -f "$SEED_IMAGE" ]]; then
+
+            echo
+            echo -e "${YELLOW}🔐 Root password is required for first boot.${NC}"
+            echo -ne "${CYAN}Set root password: ${NC}"
+
+            read -rs root_password
+            echo
+
+            if (( ${#root_password} < 8 )); then
+                error_msg "Password must contain at least 8 characters."
+                unset root_password
+                pause_screen
+                return 1
+            fi
+
+            echo -ne "${CYAN}Confirm root password: ${NC}"
+            read -rs root_password_confirm
+            echo
+
+            if [[ "$root_password" != "$root_password_confirm" ]]; then
+                error_msg "Passwords do not match."
+                unset root_password root_password_confirm
+                pause_screen
+                return 1
+            fi
+
+            generate_password_hash "$root_password"
+
+            unset root_password root_password_confirm
+
+            generate_cloud_init
+
+            write_config
+        fi
+    fi
+
+    #
+    # Final artifact validation
+    #
+
     if [[ ! -f "$VM_IMAGE" ]]; then
-        error_msg "VM disk does not exist."
+        error_msg "VM disk is still missing:"
+        echo "  $VM_IMAGE"
         pause_screen
-        return
+        return 1
     fi
 
     if [[ ! -f "$SEED_IMAGE" ]]; then
-        error_msg "Cloud-init seed is missing."
+        error_msg "Cloud-init seed is still missing:"
+        echo "  $SEED_IMAGE"
+        echo
+        echo "Run Create VM first to configure root password."
         pause_screen
-        return
+        return 1
     fi
 
     if ! port_is_free "$HOST_PORT"; then
-        error_msg "Host TCP port ${HOST_PORT} is already in use."
+        error_msg "Host port ${HOST_PORT} is already in use."
         pause_screen
-        return
+        return 1
     fi
 
     acquire_vm_lock
-
-    detect_kvm
 
     build_qemu_args
 
@@ -1071,7 +1149,7 @@ boot_vm() {
     echo -e "${WHITE}CPU:${NC}       ${CYAN}${CPU_VM}${NC}"
     echo -e "${WHITE}RAM:${NC}       ${CYAN}${RAM_VM_MB}MB${NC}"
     echo -e "${WHITE}Disk:${NC}      ${CYAN}${DISK_SIZE_GB}GB${NC}"
-    echo -e "${WHITE}Network:${NC}   ${CYAN}${HOST_PORT} -> ${GUEST_PORT}${NC}"
+    echo -e "${WHITE}SSH:${NC}       ${CYAN}${HOST_PORT} -> ${GUEST_PORT}${NC}"
     echo
 
     if [[ "$KVM_AVAILABLE" == true ]]; then
@@ -1083,74 +1161,189 @@ boot_vm() {
 
     echo
     echo -e "${GREEN}============================================================${NC}"
-    echo -e "${WHITE}🚀 Starting real Ubuntu VM console...${NC}"
-    echo -e "${DIM}QEMU exit: Ctrl+A then X${NC}"
+    echo -e "${WHITE}🚀 Starting Ubuntu 22.04 VM${NC}"
+    echo -e "${WHITE}🖥 Direct Console enabled${NC}"
+    echo -e "${DIM}Exit QEMU: Ctrl+A then X${NC}"
     echo -e "${GREEN}============================================================${NC}"
     echo
 
-    # QEMU owns the terminal from this point.
-    # No fake shell / dashboard is inserted between the user and VM.
+    #
+    # IMPORTANT:
+    # stdout stays attached to terminal for Direct Console.
+    # stderr goes to QEMU log.
+    #
+
     set +e
 
     "$QEMU_BIN" \
         "${QEMU_ARGS[@]}" \
-        >>"$QEMU_LOG" \
-        2>&1
+        2>>"$QEMU_LOG"
 
     local qemu_exit=$?
 
     set -e
 
-    rm -f "$PID_FILE" "$QMP_SOCKET"
+    rm -f \
+        "$PID_FILE" \
+        "$QMP_SOCKET"
+
     release_vm_lock
 
     echo
 
-    if [[ "$qemu_exit" -eq 0 ]]; then
+    if (( qemu_exit == 0 )); then
         success "QEMU exited normally."
     else
         warning "QEMU exited with status ${qemu_exit}."
-        echo -e "${DIM}Check log: ${QEMU_LOG}${NC}"
+        echo -e "${DIM}Log: ${QEMU_LOG}${NC}"
     fi
+
+    pause_screen
+
+    return "$qemu_exit"
+}
+
+# =====================================================================
+# CREATE VM
+# =====================================================================
+
+create_vm() {
+    header
+
+    if vm_is_running; then
+        error_msg "VM is already running."
+        pause_screen
+        return 1
+    fi
+
+    detect_architecture
+    prepare_workspace
+    install_dependencies
+    resolve_qemu_binary
+    detect_kvm
+    detect_resources
+
+    echo -e "${WHITE}Detected host:${NC}"
+    echo -e "  Architecture : ${CYAN}${ARCH}${NC}"
+    echo -e "  CPU          : ${CYAN}${CPU_VM}${NC}"
+    echo -e "  RAM          : ${CYAN}${RAM_VM_MB}MB${NC}"
+
+    if [[ "$KVM_AVAILABLE" == true ]]; then
+        echo -e "  KVM          : ${GREEN}ENABLED${NC}"
+    else
+        echo -e "  KVM          : ${YELLOW}TCG FALLBACK${NC}"
+        echo -e "  Reason       : ${DIM}${KVM_REASON}${NC}"
+    fi
+
+    echo
+
+    echo -ne "${CYAN}Hostname [${VM_NAME}]: ${NC}"
+    read -r hostname_input
+
+    VM_HOSTNAME="${hostname_input:-$VM_NAME}"
+
+    if [[ ! "$VM_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]]; then
+        error_msg "Invalid hostname."
+        pause_screen
+        return 1
+    fi
+
+    echo -ne "${CYAN}Disk size GB [20]: ${NC}"
+    read -r disk_input
+
+    DISK_SIZE_GB="${disk_input:-20}"
+
+    if ! validate_disk_size "$DISK_SIZE_GB"; then
+        error_msg "Invalid disk size."
+        pause_screen
+        return 1
+    fi
+
+    if [[ -f "$VM_IMAGE" ]]; then
+        warning "Existing VM disk detected."
+        echo "Cleaning and recreating it is NOT automatic."
+        pause_screen
+        return 1
+    fi
+
+    echo
+    echo -e "${YELLOW}🔐 Root password must contain at least 8 characters.${NC}"
+    echo -ne "${CYAN}Set root password: ${NC}"
+
+    read -rs root_password
+    echo
+
+    if (( ${#root_password} < 8 )); then
+        error_msg "Password is too short."
+        unset root_password
+        pause_screen
+        return 1
+    fi
+
+    echo -ne "${CYAN}Confirm root password: ${NC}"
+    read -rs root_password_confirm
+    echo
+
+    if [[ "$root_password" != "$root_password_confirm" ]]; then
+        error_msg "Passwords do not match."
+        unset root_password root_password_confirm
+        pause_screen
+        return 1
+    fi
+
+    generate_password_hash "$root_password"
+
+    unset root_password root_password_confirm
+
+    echo -ne "${CYAN}SSH host port [2222]: ${NC}"
+    read -r host_port_input
+
+    HOST_PORT="${host_port_input:-2222}"
+    GUEST_PORT=22
+
+    if ! validate_port "$HOST_PORT"; then
+        error_msg "Invalid host port."
+        pause_screen
+        return 1
+    fi
+
+    if ! port_is_free "$HOST_PORT"; then
+        error_msg "Port ${HOST_PORT} is already in use."
+        pause_screen
+        return 1
+    fi
+
+    echo
+    echo -e "${YELLOW}🔧 Building VM...${NC}"
+
+    download_base_image
+    create_vm_disk
+    generate_cloud_init
+    write_config
+
+    success "Ubuntu 22.04 VM created successfully."
+
+    echo
+    echo -e "${WHITE}VM configuration:${NC}"
+    echo -e "  Name : ${CYAN}${VM_NAME}${NC}"
+    echo -e "  Host : ${CYAN}${VM_HOSTNAME}${NC}"
+    echo -e "  CPU  : ${CYAN}${CPU_VM}${NC}"
+    echo -e "  RAM  : ${CYAN}${RAM_VM_MB}MB${NC}"
+    echo -e "  Disk : ${CYAN}${DISK_SIZE_GB}GB${NC}"
+    echo -e "  SSH  : ${CYAN}${HOST_PORT} -> 22${NC}"
+    echo
 
     pause_screen
 }
 
 # =====================================================================
-# RESTART
-# =====================================================================
-
-restart_vm() {
-    header
-
-    if vm_is_running; then
-        echo -e "${YELLOW}VM is currently running.${NC}"
-        echo
-        echo -ne "Restart it now? [y/N]: "
-        read -r answer
-
-        case "$answer" in
-            y|Y|yes|YES)
-                if ! stop_vm; then
-                    return 1
-                fi
-                ;;
-            *)
-                return 0
-                ;;
-        esac
-    fi
-
-    boot_vm
-}
-
-# =====================================================================
-# VM STATUS
+# STATUS
 # =====================================================================
 
 vm_status() {
     header
 
+    detect_architecture
     detect_kvm
     detect_resources
 
@@ -1188,11 +1381,25 @@ vm_status() {
         warning "VM disk does not exist."
     fi
 
+    echo
+
+    if [[ -f "$SEED_IMAGE" ]]; then
+        success "Cloud-init seed: READY"
+    else
+        warning "Cloud-init seed: MISSING"
+    fi
+
+    if [[ -f "$BASE_IMAGE" ]]; then
+        success "Ubuntu base image: READY"
+    else
+        warning "Ubuntu base image: MISSING"
+    fi
+
     pause_screen
 }
 
 # =====================================================================
-# RESOURCE INFORMATION
+# RESOURCE INFO
 # =====================================================================
 
 resource_information() {
@@ -1203,6 +1410,7 @@ resource_information() {
     detect_resources
 
     local free_space
+
     free_space="$(df -h "$WORKDIR" 2>/dev/null | awk 'NR==2 {print $4}')"
 
     echo -e "${WHITE}Host Architecture :${NC} ${CYAN}${ARCH}${NC}"
@@ -1212,17 +1420,18 @@ resource_information() {
     echo -e "${WHITE}VM RAM            :${NC} ${CYAN}${RAM_VM_MB}MB${NC}"
     echo -e "${WHITE}Free Disk Space   :${NC} ${CYAN}${free_space}${NC}"
 
+    echo
+
     if [[ "$KVM_AVAILABLE" == true ]]; then
-        echo -e "${WHITE}KVM               :${NC} ${GREEN}ENABLED${NC}"
+        echo -e "${WHITE}KVM:${NC} ${GREEN}AVAILABLE${NC}"
     else
-        echo -e "${WHITE}KVM               :${NC} ${YELLOW}UNAVAILABLE${NC}"
-        echo -e "${WHITE}Reason            :${NC} ${DIM}${KVM_REASON}${NC}"
+        echo -e "${WHITE}KVM:${NC} ${YELLOW}UNAVAILABLE${NC}"
+        echo -e "${WHITE}Reason:${NC} ${DIM}${KVM_REASON}${NC}"
     fi
 
     echo
 
     if [[ -e /dev/kvm ]]; then
-        echo -e "${WHITE}/dev/kvm:${NC}"
         ls -l /dev/kvm
     else
         warning "/dev/kvm does not exist."
@@ -1232,18 +1441,18 @@ resource_information() {
 }
 
 # =====================================================================
-# NETWORK CONFIG
+# NETWORK
 # =====================================================================
 
 network_configuration() {
     header
 
     echo -e "${WHITE}Current forwarding:${NC}"
-    echo -e "  ${CYAN}HOST ${HOST_PORT}${NC} -> ${CYAN}GUEST ${GUEST_PORT}${NC}"
+    echo -e "  ${CYAN}${HOST_PORT} -> ${GUEST_PORT}${NC}"
     echo
 
     if vm_is_running; then
-        warning "Stop the VM before changing forwarding."
+        warning "Stop VM before changing networking."
         pause_screen
         return
     fi
@@ -1258,12 +1467,12 @@ network_configuration() {
     fi
 
     if ! port_is_free "$new_host"; then
-        error_msg "Host port ${new_host} is already in use."
+        error_msg "Host port already in use."
         pause_screen
         return
     fi
 
-    echo -ne "${CYAN}Guest port [1-65535] (default 22): ${NC}"
+    echo -ne "${CYAN}Guest port [22]: ${NC}"
     read -r new_guest
 
     new_guest="${new_guest:-22}"
@@ -1279,161 +1488,82 @@ network_configuration() {
 
     write_config
 
-    success "Port forwarding updated:"
-    echo -e "${CYAN}${HOST_PORT} -> ${GUEST_PORT}${NC}"
-
+    success "Port forwarding updated."
     pause_screen
 }
 
 # =====================================================================
-# CREATE VM
+# DISK
 # =====================================================================
 
-create_vm() {
-    header
-
-    if [[ -f "$VM_IMAGE" ]]; then
-        warning "VM already exists."
-        echo
-        echo "Use Boot VM from the dashboard."
-        pause_screen
-        return
+inspect_disk() {
+    if [[ ! -f "$VM_IMAGE" ]]; then
+        error_msg "VM disk does not exist."
+        return 1
     fi
 
-    detect_architecture
-    detect_kvm
-    detect_resources
+    qemu-img info "$VM_IMAGE"
+}
 
-    echo -e "${WHITE}Detected resources:${NC}"
-    echo -e "  CPU: ${CYAN}${CPU_VM}${NC} cores"
-    echo -e "  RAM: ${CYAN}${RAM_VM_MB}MB${NC}"
-    echo -e "  Arch: ${CYAN}${ARCH}${NC}"
-
-    if [[ "$KVM_AVAILABLE" == true ]]; then
-        echo -e "  Acceleration: ${GREEN}KVM ENABLED${NC}"
-    else
-        echo -e "  Acceleration: ${YELLOW}TCG FALLBACK${NC}"
+resize_vm_disk() {
+    if vm_is_running; then
+        error_msg "Stop VM before resizing."
+        return 1
     fi
 
-    echo
-
-    echo -ne "${CYAN}Hostname [${VM_NAME}]: ${NC}"
-    read -r hostname_input
-
-    VM_HOSTNAME="${hostname_input:-$VM_NAME}"
-
-    if [[ ! "$VM_HOSTNAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]{0,62}$ ]]; then
-        error_msg "Invalid hostname."
-        pause_screen
-        return
+    if [[ ! -f "$VM_IMAGE" ]]; then
+        error_msg "VM disk does not exist."
+        return 1
     fi
 
-    echo -ne "${CYAN}Disk size GB [20]: ${NC}"
-    read -r disk_input
+    echo -ne "${CYAN}New absolute disk size in GB [5-4096]: ${NC}"
+    read -r new_size
 
-    DISK_SIZE_GB="${disk_input:-20}"
-
-    if ! validate_disk_size "$DISK_SIZE_GB"; then
+    if ! validate_disk_size "$new_size"; then
         error_msg "Invalid disk size."
-        pause_screen
-        return
-    fi
-
-    echo
-    echo -e "${YELLOW}Root password will NOT be displayed.${NC}"
-    echo -ne "${CYAN}Set root password: ${NC}"
-
-    read -rs root_password
-    echo
-
-    if [[ "${#root_password}" -lt 8 ]]; then
-        error_msg "Password must contain at least 8 characters."
-        unset root_password
-        pause_screen
-        return
-    fi
-
-    echo -ne "${CYAN}Confirm root password: ${NC}"
-    read -rs root_password_confirm
-    echo
-
-    if [[ "$root_password" != "$root_password_confirm" ]]; then
-        error_msg "Passwords do not match."
-        unset root_password root_password_confirm
-        pause_screen
-        return
-    fi
-
-    generate_password_hash "$root_password"
-
-    unset root_password root_password_confirm
-
-    echo -ne "${CYAN}SSH host port [2222]: ${NC}"
-    read -r host_port_input
-
-    HOST_PORT="${host_port_input:-2222}"
-
-    if ! validate_port "$HOST_PORT"; then
-        error_msg "Invalid host port."
-        pause_screen
-        return
-    fi
-
-    if ! port_is_free "$HOST_PORT"; then
-        error_msg "Port ${HOST_PORT} is already occupied."
-        pause_screen
-        return
-    fi
-
-    GUEST_PORT=22
-
-    prepare_workspace
-    install_dependencies
-
-    # Re-detect binaries after package installation.
-    detect_architecture
-
-    QEMU_BIN="$(command -v qemu-system-x86_64 || command -v qemu-system-aarch64 || true)"
-    SOCAT_BIN="$(command -v socat || true)"
-
-    if [[ -z "$QEMU_BIN" ]]; then
-        error_msg "QEMU binary was not found."
         return 1
     fi
 
-    if [[ -z "$SOCAT_BIN" ]]; then
-        error_msg "socat is required for QMP shutdown."
+    local current_bytes
+
+    current_bytes="$(
+        qemu-img info --output=json "$VM_IMAGE" 2>/dev/null |
+        grep -o '"virtual-size":[0-9]*' |
+        head -n1 |
+        cut -d: -f2
+    )"
+
+    if [[ -z "$current_bytes" ]]; then
+        error_msg "Unable to determine current disk size."
         return 1
     fi
 
-    download_base_image
-    create_vm_disk
-    generate_cloud_init
+    local current_gb=$((current_bytes / 1024 / 1024 / 1024))
+
+    if (( new_size < current_gb )); then
+        error_msg "Disk shrinking is disabled."
+        return 1
+    fi
+
+    if (( new_size == current_gb )); then
+        success "Disk is already ${new_size}G."
+        return 0
+    fi
+
+    $SUDO_CMD qemu-img resize \
+        "$VM_IMAGE" \
+        "${new_size}G"
+
+    DISK_SIZE_GB="$new_size"
 
     write_config
 
-    success "Ubuntu VM created successfully."
-
-    echo
-    echo -e "${WHITE}VM configuration:${NC}"
-    echo -e "  Name : ${CYAN}${VM_NAME}${NC}"
-    echo -e "  Host : ${CYAN}${VM_HOSTNAME}${NC}"
-    echo -e "  CPU  : ${CYAN}${CPU_VM}${NC}"
-    echo -e "  RAM  : ${CYAN}${RAM_VM_MB}MB${NC}"
-    echo -e "  Disk : ${CYAN}${DISK_SIZE_GB}GB${NC}"
-    echo -e "  SSH  : ${CYAN}${HOST_PORT} -> 22${NC}"
-
-    pause_screen
-
-    boot_vm
+    success "Disk resized successfully."
 }
-
-# =====================================================================
-# DISK MANAGEMENT
-# =====================================================================
 
 disk_management() {
     while true; do
+
         header
 
         echo -e "${CYAN}[1]${NC} Disk Information"
@@ -1447,11 +1577,11 @@ disk_management() {
         case "$choice" in
             1)
                 header
-                inspect_disk
+                inspect_disk || true
                 pause_screen
                 ;;
             2)
-                resize_vm_disk
+                resize_vm_disk || true
                 pause_screen
                 ;;
             3)
@@ -1462,11 +1592,12 @@ disk_management() {
                 sleep 1
                 ;;
         esac
+
     done
 }
 
 # =====================================================================
-# CLEAN VM
+# CLEAN
 # =====================================================================
 
 clean_vm() {
@@ -1474,27 +1605,30 @@ clean_vm() {
 
     if vm_is_running; then
         error_msg "VM is running."
-        echo "Stop it before cleaning."
         pause_screen
         return
     fi
 
     echo -e "${RED}⚠ WARNING${NC}"
     echo
-    echo "This will remove the VM disk, seed, cloud-init data and config."
-    echo "The Ubuntu BASE IMAGE will be preserved."
+    echo "This removes:"
+    echo "  • VM disk"
+    echo "  • cloud-init seed"
+    echo "  • VM config"
+    echo "  • cloud-init data"
+    echo
+    echo "The BASE IMAGE will remain."
     echo
 
     echo -ne "${YELLOW}Type DELETE to continue: ${NC}"
     read -r confirmation
 
     if [[ "$confirmation" != "DELETE" ]]; then
-        warning "Operation cancelled."
+        warning "Cancelled."
         pause_screen
         return
     fi
 
-    # Explicitly validated paths only.
     rm -f \
         "$VM_IMAGE" \
         "$SEED_IMAGE" \
@@ -1505,14 +1639,42 @@ clean_vm() {
         "$QMP_SOCKET" \
         "$LOCK_FILE"
 
-    success "VM cleaned successfully."
-    echo -e "${DIM}Base Ubuntu image was preserved.${NC}"
+    success "VM cleaned."
+    echo -e "${DIM}Ubuntu base image preserved.${NC}"
 
     pause_screen
 }
 
 # =====================================================================
-# INITIALIZATION
+# RESTART
+# =====================================================================
+
+restart_vm() {
+    header
+
+    if vm_is_running; then
+
+        echo -ne "${YELLOW}Restart running VM? [y/N]: ${NC}"
+        read -r answer
+
+        case "$answer" in
+            y|Y|yes|YES)
+                if ! stop_vm; then
+                    return 1
+                fi
+                ;;
+            *)
+                return 0
+                ;;
+        esac
+
+    fi
+
+    boot_vm
+}
+
+# =====================================================================
+# INITIALIZE
 # =====================================================================
 
 initialize() {
@@ -1521,26 +1683,36 @@ initialize() {
     prepare_workspace
 
     detect_architecture
-    detect_kvm
-    detect_resources
 
-    if command -v qemu-system-x86_64 >/dev/null 2>&1; then
-        QEMU_BIN="$(command -v qemu-system-x86_64)"
-    elif command -v qemu-system-aarch64 >/dev/null 2>&1; then
-        QEMU_BIN="$(command -v qemu-system-aarch64)"
-    fi
+    #
+    # FIX:
+    # Install packages BEFORE resolving QEMU path.
+    #
+    install_dependencies
+
+    resolve_qemu_binary
 
     SOCAT_BIN="$(command -v socat || true)"
+
+    if [[ -z "$SOCAT_BIN" ]]; then
+        error_msg "socat is missing."
+        exit 1
+    fi
+
+    detect_kvm
+    detect_resources
 
     load_config || true
 }
 
 # =====================================================================
-# MAIN MENU
+# MENU
 # =====================================================================
 
 show_menu() {
+
     while true; do
+
         header
 
         detect_kvm
@@ -1576,53 +1748,65 @@ show_menu() {
         echo -e "${RED}────────────────────────────────────────────────────────────${NC}"
         echo
 
-        echo -ne "${WHITE}👹 SUKUNA V4 > ${NC}"
+        echo -ne "${WHITE}👹 SUKUNA V4.1 > ${NC}"
         read -r choice
 
         case "$choice" in
+
             1)
-                boot_vm
+                boot_vm || true
                 ;;
+
             2)
-                restart_vm
+                restart_vm || true
                 ;;
+
             3)
-                stop_vm
+                stop_vm || true
                 pause_screen
                 ;;
+
             4)
                 vm_status
                 ;;
+
             5)
                 resource_information
                 ;;
+
             6)
                 network_configuration
                 ;;
+
             7)
                 disk_management
                 ;;
+
             8)
                 clean_vm
                 ;;
+
             9)
-                create_vm
+                create_vm || true
                 ;;
+
             0)
                 echo
-                success "SUKUNA V4 shutting down dashboard."
+                success "SUKUNA V4.1 shutting down dashboard."
                 exit 0
                 ;;
+
             *)
                 error_msg "Invalid choice."
                 sleep 1
                 ;;
+
         esac
     done
 }
 
 # =====================================================================
-# ENTRY POINT
+# MAIN
 # =====================================================================
 
 main() {
