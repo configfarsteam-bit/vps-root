@@ -1,540 +1,387 @@
-#!/usr/bin/env bash
-# ============================================================================
-# DXD LABS - SUKUNA V7 BOOT EDITION
-# One-command Ubuntu 22.04 QEMU/KVM server launcher.
-#
-# Run:
-#   sudo bash SUKUNA_V7_BOOT.sh
-#
-# The script intentionally has NO management menu. It bootstraps dependencies,
-# downloads/verifies the Ubuntu cloud image, creates a fresh guest disk and
-# cloud-init seed, starts QEMU/KVM, waits for SSH, and prints connection data.
-# ============================================================================
+#!/bin/bash
 
-set -Eeuo pipefail
-IFS=$'\n\t'
-umask 077
-export LC_ALL=C.UTF-8
+# Clear terminal for clean dashboard view
+clear
 
-readonly VERSION='7.1.0-BOOT'
-readonly HOST_SSH_PORT="${SUKUNA_SSH_PORT:-2222}"
-readonly GUEST_SSH_PORT=22
-readonly VM_NAME="${SUKUNA_VM_NAME:-sukuna-server}"
-readonly VM_USER="${SUKUNA_VM_USER:-sukuna}"
-readonly VM_RAM_MIB="${SUKUNA_RAM_MIB:-0}"     # 0 = auto
-readonly VM_CPUS="${SUKUNA_CPUS:-0}"            # 0 = auto
-readonly VM_DISK_GIB="${SUKUNA_DISK_GIB:-20}"
-readonly BOOT_TIMEOUT="${SUKUNA_BOOT_TIMEOUT:-180}"
-readonly SSH_TIMEOUT="${SUKUNA_SSH_TIMEOUT:-180}"
-readonly HOME_BASE="${SUKUNA_HOME:-/var/lib/sukuna}"
-readonly DATA_DIR="$HOME_BASE/data"
-readonly BASE_DIR="$DATA_DIR/base"
-readonly VM_DIR="$DATA_DIR/vm"
-readonly RUN_DIR="$DATA_DIR/run"
-readonly LOG_DIR="$DATA_DIR/log"
-readonly SEED_DIR="$DATA_DIR/seed"
-readonly BASE_IMG="$BASE_DIR/jammy-server-cloudimg-amd64.img"
-readonly BASE_SHA="$BASE_DIR/jammy-server-cloudimg-amd64.img.sha256"
-readonly DISK_IMG="$VM_DIR/$VM_NAME.qcow2"
-readonly SEED_ISO="$VM_DIR/$VM_NAME-seed.iso"
-readonly PID_FILE="$RUN_DIR/qemu.pid"
-readonly QMP_SOCK="$RUN_DIR/qmp.sock"
-readonly QEMU_LOG="$LOG_DIR/qemu.log"
-readonly CONSOLE_LOG="$LOG_DIR/console.log"
-readonly META_FILE="$SEED_DIR/meta-data"
-readonly USERDATA_FILE="$SEED_DIR/user-data"
-readonly VENDOR_FILE="$SEED_DIR/vendor-data"
-readonly QEMU_PATH="${SUKUNA_QEMU:-/usr/bin/qemu-system-x86_64}"
-readonly QEMU_IMG_PATH="${SUKUNA_QEMU_IMG:-/usr/bin/qemu-img}"
-readonly PYTHON_BIN="${SUKUNA_PYTHON:-python3}"
-readonly CLOUDA_LOCALDS="$(command -v cloud-localds 2>/dev/null || true)"
-readonly OVMF_CODE_CANDIDATES=(
-  /usr/share/OVMF/OVMF_CODE_4M.fd
-  /usr/share/OVMF/OVMF_CODE.fd
-  /usr/share/edk2/ovmf/x64/OVMF_CODE.fd
-)
-readonly OVMF_VARS_CANDIDATES=(
-  /usr/share/OVMF/OVMF_VARS_4M.fd
-  /usr/share/OVMF/OVMF_VARS.fd
-  /usr/share/edk2/ovmf/vars/OVMF_VARS.fd
-)
-readonly UBUNTU_URL='https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img'
-readonly UBUNTU_SUMS_URL='https://cloud-images.ubuntu.com/jammy/current/SHA256SUMS'
+# ==========================================
+# 🌟 PREMIUM COLOR CODES & FX
+# ==========================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
 
-RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
-BLUE=$'\033[0;34m'; CYAN=$'\033[0;36m'; MAGENTA=$'\033[0;35m'; RESET=$'\033[0m'
+TMUX_SESSION="daytona_vps"
+VM_WINDOW="vm-console"
+HOST_WINDOW="host-shell"
 
-log(){ printf '%b[%s]%b %s\n' "$BLUE" 'INFO' "$RESET" "$*"; }
-ok(){ printf '%b[%s]%b %s\n' "$GREEN" ' OK ' "$RESET" "$*"; }
-warn(){ printf '%b[%s]%b %s\n' "$YELLOW" 'WARN' "$RESET" "$*" >&2; }
-die(){ printf '%b[ERR ]%b %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+# FUNCTION: TYPING EFFECT ANIMATION
+type_effect() {
+    local text="$1"
+    local delay="$2"
+    for (( i=0; i<${#text}; i++ )); do
+        echo -n "${text:$i:1}"
+        sleep "$delay"
+    done
+    echo ""
+}
 
-cleanup_on_error(){
-  local rc=$?
-  if (( rc != 0 )); then
-    warn "Boot failed (exit $rc). See: $QEMU_LOG"
-    if [[ -s "$PID_FILE" ]]; then
-      local pid
-      pid=$(cat "$PID_FILE" 2>/dev/null || true)
-      if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
-        warn "QEMU process $pid is still running. It was not blindly killed."
-      fi
+# FUNCTION: LOADING BAR ANIMATION
+loading_bar() {
+    local title="$1"
+    echo -ne "${YELLOW}⏳ $title ${NC}[          ]"
+    sleep 0.3
+    echo -ne "\b\b\b\b\b\b\b\b\b\b\b[===       ]"
+    sleep 0.3
+    echo -ne "\b\b\b\b\b\b\b\b\b\b\b[======     ]"
+    sleep 0.3
+    echo -ne "\b\b\b\b\b\b\b\b\b\b\b[=========  ]"
+    sleep 0.3
+    echo -ne "\b\b\b\b\b\b\b\b\b\b\b[==========]"
+    echo -e " ${GREEN}DONE!${NC}"
+}
+
+# AUTOMATED ROOT/SUDO PRIVILEGE CHECK
+if [ "$(id -u)" -eq 0 ]; then
+    SUDO_CMD=""
+else
+    SUDO_CMD="sudo"
+fi
+
+# BUGFIX: pin a single working directory for ALL VM-related files
+# (qcow2 image, seed.img, user-data, .vps_env). Previously these relative
+# files were created in whatever directory the script happened to be
+# launched from, so "Restart" or "Configure port" would silently fail to
+# find them if you ran the script again from a different shell/directory.
+WORKDIR="/home/daytona"
+$SUDO_CMD mkdir -p "$WORKDIR" > /dev/null 2>&1
+$SUDO_CMD chmod 777 "$WORKDIR" > /dev/null 2>&1
+cd "$WORKDIR" || { echo -e "\033[0;31m❌ Cannot access or create $WORKDIR${NC}"; exit 1; }
+
+# ==========================================
+# MAIN INTERACTIVE LIST MENU
+# ==========================================
+show_menu() {
+    clear
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "${WHITE}          [👹 DXD LABS PREMIUM VPS DASHBOARD 👹]          ${NC}"
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "${WHITE}                ┌─────────────────────────┐               ${NC}"
+    echo -e "${WHITE}                │   ${RED}█▀▀█ █──█ █▄─▄█ █▀▀█${WHITE}  │  <[SUKUNA V2] ${NC}"
+    echo -e "${WHITE}                │   ${RED}█▄▄█ █▄▄█ █ █ █ █▄▄█${WHITE}  │               ${NC}"
+    echo -e "${WHITE}                └─────────────────────────┘               ${NC}"
+    echo -e "${PURPLE}                   (█)─(█)     (█)─(█)                   ${NC}"
+    echo -e "${PURPLE}                  █████████   █████████                  ${NC}"
+    echo -e "${RED}                 ███████████████████████                 ${NC}"
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "${CYAN}  ____  _____ _   _ ____     ____    _    __  __ ___ _   _  ____ ${NC}"
+    echo -e "${CYAN} |  _ \| ____| | | |  _ \   / ___|  / \  |  \/  |_ _| \ | |/ ___|${NC}"
+    echo -e "${CYAN} | | | |  _| | | | | |_) | | |  _  / _ \ | |\/| || ||  \| | |  _ ${NC}"
+    echo -e "${CYAN} | |_| | |___| |_| |  __/  | |_| |/ ___ \| |  | || || |\  | |_| |${NC}"
+    echo -e "${CYAN} |____/|_____|\___/|_|      \____/_/   \_\_|  |_|___|_| \_|\____|${NC}"
+    echo -e "${RED}==========================================================${NC}"
+    echo ""
+    echo -e "${YELLOW}👉 SELECT AN OPTION TO PROCEED FROM LIST:${NC}"
+    echo ""
+    echo -e "  ${CYAN}[1]${NC} Create & Boot New Ubuntu VPS Instance"
+    echo -e "  ${CYAN}[2]${NC} Restart Existing VPS Instance"
+    echo -e "  ${CYAN}[3]${NC} Modify TCP Port Forward Rules (Default: 2222)"
+    echo -e "  ${CYAN}[4]${NC} Remove/Clean VPS Cache Files"
+    echo -e "  ${CYAN}[5]${NC} Attach Locally to VM Console / Host Shell (tmux)"
+    echo -e "  ${CYAN}[6]${NC} Show sshx Link Again"
+    echo -e "  ${CYAN}[7]${NC} Exit Dashboard (VM keeps running in background)"
+    echo ""
+    echo -e "${RED}==========================================================${NC}"
+    echo -ne "${WHITE}🔹 Enter Choice [1-7]: ${NC}"
+    read CHOICE
+
+    case "$CHOICE" in
+        1) create_vps ;;
+        2) restart_vps ;;
+        3) configure_tcp ;;
+        4) clean_vps ;;
+        5) attach_local ;;
+        6) show_sshx_link ;;
+        7) exit 0 ;;
+        *) echo -e "${RED}❌ Invalid Choice! Please select 1-7.${NC}"; sleep 2; show_menu ;;
+    esac
+}
+
+# STEP 1: CONFIGURE STORAGE & DOWNLOAD CLOUD ARCHITECTURE
+create_vps() {
+    clear
+    echo -e "${RED}==========================================================${NC}"
+    echo -e "${WHITE}⚙️  CONFIGURE YOUR VIRTUAL MACHINE SPECIFICATIONS${NC}"
+    echo -e "${RED}==========================================================${NC}"
+    echo ""
+
+    echo -ne "${BLUE}🔹 Enter RAM Size in GB (e.g., 4, 8, 16, 32): ${NC}"
+    read RAM_GB
+    echo -ne "${BLUE}🔹 Enter CPU Cores (e.g., 2, 4, 8): ${NC}"
+    read CPU_CORES
+    echo -ne "${BLUE}🔹 Enter Disk Space to ADD in GB (e.g., 10, 20): ${NC}"
+    read DISK_ADD
+    # BUGFIX: DISK_ADD had no default, so leaving it blank produced
+    # "qemu-img resize ... +G" which is an invalid size and fails silently.
+    DISK_ADD=${DISK_ADD:-10}
+    echo -ne "${BLUE}🔹 Create Username (Default: ubuntu): ${NC}"
+    read USER_NAME
+    USER_NAME=${USER_NAME:-ubuntu}
+    echo -ne "${BLUE}🔹 Create Password (leave blank to auto-generate a strong one): ${NC}"
+    read -s USER_PASS
+    echo ""
+    if [ -z "$USER_PASS" ]; then
+        USER_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+        echo -e "${YELLOW}🔐 Auto-generated password: ${CYAN}${USER_PASS}${NC}"
     fi
-  fi
-  exit "$rc"
-}
-trap cleanup_on_error EXIT
-trap 'exit 130' INT TERM
 
-require_root(){
-  [[ "$(id -u)" -eq 0 ]] || die 'Run as root: sudo bash SUKUNA_V7_BOOT.sh'
-}
+    # 2222 is set as the foundational port base
+    TCP_HOST_PORT=${TCP_HOST_PORT:-2222}
+    TCP_GUEST_PORT=22
 
-apt_install(){
-  local apt_get
-  apt_get=$(command -v apt-get || true)
-  [[ -n "$apt_get" ]] || die 'This automatic bootstrap currently supports Debian/Ubuntu systems with apt-get.'
-  export DEBIAN_FRONTEND=noninteractive
-  "$apt_get" update -y
-  "$apt_get" install -y --no-install-recommends \
-    ca-certificates curl coreutils procps iproute2 openssh-client openssl \
-    qemu-system-x86 qemu-utils cloud-image-utils xorriso ovmf python3
-}
+    echo ""
+    echo -e "${YELLOW}⏳ Installing core dependencies... Please wait.${NC}"
+    echo ""
 
-have(){ command -v "$1" >/dev/null 2>&1; }
+    $SUDO_CMD apt-get update -y > /dev/null 2>&1
+    $SUDO_CMD apt-get install -y qemu-system-x86 qemu-utils wget cloud-image-utils curl tmux > /dev/null 2>&1
 
-ensure_dependencies(){
-  local missing=0 c
-  for c in curl sha256sum awk sed grep find flock ss openssl python3; do
-    have "$c" || missing=1
-  done
-  [[ -x "$QEMU_IMG_PATH" ]] || missing=1
-  [[ -x "$QEMU_PATH" ]] || missing=1
-  if ! have cloud-localds && ! have xorriso && ! have genisoimage; then missing=1; fi
-  if (( missing == 0 )); then
-    ok 'Required host dependencies are already installed.'
-    return
-  fi
-  warn 'Required packages are missing. Installing automatically...'
-  apt_install
-  [[ -x "$QEMU_IMG_PATH" ]] || die "QEMU binary missing after package installation: $QEMU_IMG_PATH"
-  [[ -x "$QEMU_PATH" ]] || die "QEMU binary missing after package installation: $QEMU_PATH"
-  have curl || die 'curl is still missing after package installation.'
-  ok 'Host dependencies installed.'
-}
-
-safe_dirs(){
-  mkdir -p "$BASE_DIR" "$VM_DIR" "$RUN_DIR" "$LOG_DIR" "$SEED_DIR"
-  chmod 700 "$HOME_BASE" "$DATA_DIR" "$BASE_DIR" "$VM_DIR" "$RUN_DIR" "$LOG_DIR" "$SEED_DIR"
-}
-
-validate_inputs(){
-  [[ "$HOST_SSH_PORT" =~ ^[0-9]+$ ]] && (( HOST_SSH_PORT >= 1024 && HOST_SSH_PORT <= 65535 )) || die 'SUKUNA_SSH_PORT must be 1024..65535.'
-  [[ "$VM_RAM_MIB" =~ ^[0-9]+$ ]] || die 'SUKUNA_RAM_MIB must be numeric.'
-  [[ "$VM_CPUS" =~ ^[0-9]+$ ]] || die 'SUKUNA_CPUS must be numeric.'
-  [[ "$VM_DISK_GIB" =~ ^[0-9]+$ ]] && (( VM_DISK_GIB >= 4 && VM_DISK_GIB <= 2048 )) || die 'SUKUNA_DISK_GIB must be 4..2048.'
-  [[ "$VM_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die 'Invalid SUKUNA_VM_USER.'
-}
-
-lock_instance(){
-  exec 9>"$RUN_DIR/boot.lock"
-  flock -n 9 || die 'Another SUKUNA boot is already running.'
-}
-
-pid_running(){
-  local pid=''
-  [[ -s "$PID_FILE" ]] || return 1
-  pid=$(cat "$PID_FILE" 2>/dev/null || true)
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  [[ -r "/proc/$pid/status" ]] || return 1
-  local state exe
-  state=$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)
-  [[ "$state" != Z ]] || return 1
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-  [[ "$exe" == "$QEMU_PATH" ]] || return 1
-  kill -0 "$pid" 2>/dev/null
-}
-
-port_free(){
-  ! ss -ltnH "sport = :$HOST_SSH_PORT" 2>/dev/null | grep -q .
-}
-
-calc_resources(){
-  local mem_kib cpus quota period avail_mib safe_mib
-  mem_kib=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo)
-  [[ "$mem_kib" =~ ^[0-9]+$ ]] || mem_kib=$((2048*1024))
-  avail_mib=$((mem_kib/1024))
-
-  if [[ -r /sys/fs/cgroup/memory.max ]]; then
-    local maxmem
-    maxmem=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)
-    if [[ "$maxmem" =~ ^[0-9]+$ ]] && (( maxmem > 0 )); then
-      local cg_mib=$((maxmem/1024/1024))
-      (( cg_mib < avail_mib )) && avail_mib=$cg_mib
+    if [ ! -f "/home/daytona/ubuntu22.qcow2" ]; then
+        echo -e "${YELLOW}📥 Downloading Ubuntu 22.04 Cloud Image to /home/daytona/...${NC}"
+        $SUDO_CMD wget -q --show-progress https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img -O /home/daytona/ubuntu22.qcow2
+        $SUDO_CMD chmod 666 /home/daytona/ubuntu22.qcow2
+    else
+        echo -e "${GREEN}✅ Existing Ubuntu Image Cache Detected at /home/daytona/.${NC}"
     fi
-  fi
 
-  safe_mib=$((avail_mib - 768))
-  (( safe_mib < 512 )) && safe_mib=512
-  local ram="$VM_RAM_MIB"
-  if (( ram == 0 )); then
-    ram=$((safe_mib * 75 / 100))
-    (( ram < 512 )) && ram=512
-    (( ram > 8192 )) && ram=8192
-  fi
-  (( ram > safe_mib )) && die "Requested RAM ${ram} MiB exceeds safe host allowance ${safe_mib} MiB."
-
-  cpus=$(nproc 2>/dev/null || echo 1)
-  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
-    read -r quota period < /sys/fs/cgroup/cpu.max || true
-    if [[ "$quota" =~ ^[0-9]+$ ]] && [[ "$period" =~ ^[0-9]+$ ]] && (( period > 0 )); then
-      local cg_cpu=$((quota/period))
-      (( cg_cpu < 1 )) && cg_cpu=1
-      (( cg_cpu < cpus )) && cpus=$cg_cpu
-    fi
-  fi
-  local guest_cpus="$VM_CPUS"
-  if (( guest_cpus == 0 )); then
-    guest_cpus=$cpus
-    (( guest_cpus > 8 )) && guest_cpus=8
-  fi
-  (( guest_cpus < 1 )) && guest_cpus=1
-  (( guest_cpus > cpus )) && die "Requested vCPU count $guest_cpus exceeds host allowance $cpus."
-
-  printf '%s\t%s\n' "$ram" "$guest_cpus"
-}
-
-kvm_ok(){
-  [[ -r /dev/kvm && -w /dev/kvm ]] || return 1
-  "$PYTHON_BIN" - <<'PY' 2>/dev/null
-import fcntl, os, struct
-fd=os.open('/dev/kvm', os.O_RDWR|os.O_CLOEXEC)
-try:
-    ver=fcntl.ioctl(fd, 0xAE00)
-    if ver != 12:
-        raise SystemExit(1)
-finally:
-    os.close(fd)
-PY
-}
-
-ensure_python(){
-  have python3 || { apt_install; have python3 || die 'python3 is required.'; }
-}
-
-# SHA256SUMS contains the exact image filename and checksum; verify the image
-# itself, never a converted qcow2 derivative.
-prepare_base_image(){
-  mkdir -p "$BASE_DIR"
-  local sums tmp_sum expected actual
-  if [[ -f "$BASE_IMG" && -s "$BASE_IMG" && -s "$BASE_SHA" ]]; then
-    expected=$(awk -v f="$(basename "$BASE_IMG")" '$2 == f || $2 == "*"f {print $1; exit}' "$BASE_SHA" 2>/dev/null || true)
-    if [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
-      actual=$(sha256sum "$BASE_IMG" | awk '{print $1}')
-      if [[ "$actual" == "$expected" ]]; then
-        ok 'Ubuntu cloud image cache verified.'
-        return
-      fi
-    fi
-    warn 'Cached Ubuntu image failed checksum verification; replacing it.'
-    rm -f -- "$BASE_IMG" "$BASE_SHA"
-  fi
-
-  log 'Downloading Ubuntu 22.04 cloud image checksum list...'
-  sums="$BASE_DIR/SHA256SUMS.download"
-  curl --fail --silent --show-error --location --retry 5 --retry-delay 2 \
-    --connect-timeout 15 --max-time 120 -o "$sums" "$UBUNTU_SUMS_URL"
-  expected=$(awk -v f="$(basename "$BASE_IMG")" '$2 == f || $2 == "*"f {print $1; exit}' "$sums" || true)
-  [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] || die 'Could not extract Ubuntu cloud-image SHA256.'
-
-  log 'Downloading Ubuntu 22.04 cloud image...'
-  local tmp_img="$BASE_IMG.part"
-  rm -f -- "$tmp_img"
-  curl --fail --silent --show-error --location --retry 5 --retry-delay 2 \
-    --connect-timeout 15 --max-time 1800 -o "$tmp_img" "$UBUNTU_URL"
-  actual=$(sha256sum "$tmp_img" | awk '{print $1}')
-  [[ "$actual" == "$expected" ]] || { rm -f -- "$tmp_img"; die 'Ubuntu image SHA256 verification failed.'; }
-  mv -f -- "$tmp_img" "$BASE_IMG"
-  printf '%s  %s\n' "$expected" "$(basename "$BASE_IMG")" > "$BASE_SHA"
-  chmod 600 "$BASE_IMG" "$BASE_SHA"
-  rm -f -- "$sums"
-  ok 'Ubuntu cloud image downloaded and verified.'
-}
-
-prepare_guest_disk(){
-  if [[ -f "$DISK_IMG" ]]; then
-    local virtual actual
-    virtual=$($QEMU_IMG_PATH info --output=json -- "$DISK_IMG" 2>/dev/null | awk -F: '/"virtual-size"/{gsub(/[, ]/,"",$2); print $2; exit}' || true)
-    actual=$((virtual / 1024 / 1024 / 1024))
-    if [[ "$actual" =~ ^[0-9]+$ ]] && (( actual >= VM_DISK_GIB )); then
-      ok "Guest disk exists: ${actual} GiB."
-      return
-    fi
-    die "Existing guest disk is smaller than requested ${VM_DISK_GIB} GiB. Remove $DISK_IMG manually to recreate it."
-  fi
-  log "Creating ${VM_DISK_GIB} GiB guest disk..."
-  "$QEMU_IMG_PATH" create -f qcow2 -o lazy_refcounts=on,compression_type=zstd "$DISK_IMG" "${VM_DISK_GIB}G" >/dev/null
-  "$QEMU_IMG_PATH" check --quiet -- "$DISK_IMG" >/dev/null
-  chmod 600 "$DISK_IMG"
-  ok 'Guest disk created and checked.'
-}
-
-generate_credentials(){
-  local cred_file="$RUN_DIR/credentials.txt"
-  if [[ -s "$cred_file" ]]; then return; fi
-  local password
-  password=$(tr -dc 'A-Za-z0-9@#%+=_' </dev/urandom | head -c 20 || true)
-  [[ ${#password} -ge 16 ]] || password="$(date +%s)-$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')"
-  printf 'SUKUNA_VM_USER=%s\nSUKUNA_VM_PASSWORD=%s\n' "$VM_USER" "$password" > "$cred_file"
-  chmod 600 "$cred_file"
-}
-
-prepare_cloud_init(){
-  local password
-  password=$(awk -F= '/^SUKUNA_VM_PASSWORD=/{print substr($0,index($0,$2)); exit}' "$RUN_DIR/credentials.txt")
-  local ssh_pub=''
-  if [[ -f /root/.ssh/authorized_keys ]]; then
-    ssh_pub=$(head -n1 /root/.ssh/authorized_keys | tr -d '\r')
-  fi
-
-  cat > "$META_FILE" <<EOF_META
-instance-id: $VM_NAME-$(date +%s)
-local-hostname: $VM_NAME
-EOF_META
-
-  cat > "$USERDATA_FILE" <<EOF_USER
+    loading_bar "Generating Cloud-Init Matrix"
+    cat <<EOF > user-data
 #cloud-config
-preserve_hostname: false
-hostname: $VM_NAME
-manage_etc_hosts: true
-ssh_pwauth: true
-users:
-  - default
-  - name: $VM_USER
-    gecos: SUKUNA Server User
-    groups: [adm, sudo]
-    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
-    shell: /bin/bash
-    lock_passwd: false
-    passwd: $(openssl passwd -6 "$password")
-EOF_USER
+ssh_pwauth: True
+chpasswd:
+  list: |
+    ${USER_NAME}:${USER_PASS}
+  expire: False
+EOF
 
-  if [[ -n "$ssh_pub" && "$ssh_pub" =~ ^(ssh-|ecdsa-|sk-) ]]; then
-    printf '    ssh_authorized_keys:\n      - %s\n' "$ssh_pub" >> "$USERDATA_FILE"
-  fi
+    cloud-localds seed.img user-data > /dev/null 2>&1
+    loading_bar "Expanding Server Hard Disk Allocation"
+    $SUDO_CMD qemu-img resize /home/daytona/ubuntu22.qcow2 +${DISK_ADD}G > /dev/null 2>&1
 
-  cat >> "$USERDATA_FILE" <<'EOF_USER2'
-package_update: true
-packages:
-  - openssh-server
-  - ca-certificates
-  - curl
-  - sudo
-  - qemu-guest-agent
-runcmd:
-  - systemctl enable --now ssh || systemctl enable --now ssh.service || true
-  - systemctl enable --now qemu-guest-agent || true
-  - mkdir -p /etc/ssh/sshd_config.d
-  - printf '%s\n' 'PasswordAuthentication yes' 'PubkeyAuthentication yes' 'PermitRootLogin no' > /etc/ssh/sshd_config.d/90-sukuna.conf
-  - systemctl restart ssh || systemctl restart ssh.service || true
-EOF_USER2
-
-  printf '#cloud-config\n' > "$VENDOR_FILE"
-  chmod 600 "$META_FILE" "$USERDATA_FILE" "$VENDOR_FILE"
+    save_env
+    boot_qemu
 }
 
-create_seed_iso(){
-  if [[ -f "$SEED_ISO" && -s "$SEED_ISO" ]]; then
-    "$QEMU_IMG_PATH" info "$SEED_ISO" >/dev/null 2>&1 || true
-  fi
-  rm -f -- "$SEED_ISO.part"
-
-  if have cloud-localds; then
-    cloud-localds "$SEED_ISO.part" "$USERDATA_FILE" "$META_FILE" >/dev/null
-  elif have xorriso; then
-    xorriso -as mkisofs -quiet -volid cidata -joliet -rock \
-      -output "$SEED_ISO.part" "$USERDATA_FILE" "$META_FILE" >/dev/null 2>&1
-  elif have genisoimage; then
-    genisoimage -quiet -output "$SEED_ISO.part" -volid cidata -joliet -rock "$USERDATA_FILE" "$META_FILE" >/dev/null
-  else
-    die 'No cloud-init seed ISO tool available (cloud-localds/xorriso/genisoimage).'
-  fi
-  [[ -s "$SEED_ISO.part" ]] || die 'Failed to create cloud-init seed ISO.'
-  mv -f -- "$SEED_ISO.part" "$SEED_ISO"
-  chmod 600 "$SEED_ISO"
-  ok 'Cloud-init seed created.'
-}
-
-find_uefi(){
-  local i
-  for i in "${!OVMF_CODE_CANDIDATES[@]}"; do
-    if [[ -f "${OVMF_CODE_CANDIDATES[$i]}" && -f "${OVMF_VARS_CANDIDATES[$i]}" ]]; then
-      printf '%s|%s\n' "${OVMF_CODE_CANDIDATES[$i]}" "${OVMF_VARS_CANDIDATES[$i]}"
-      return 0
+# STEP 2: NETWORK CONTROL MODIFIER
+configure_tcp() {
+    clear
+    echo -e "${YELLOW}==========================================================${NC}"
+    echo -e "${WHITE}🔄⚙️  MANAGE CUSTOM TCP PORT FORWARDING RULES ${NC}"
+    echo -e "${YELLOW}==========================================================${NC}"
+    echo ""
+    if [ -f ".vps_env" ]; then
+        source .vps_env
     fi
-  done
-  return 1
-}
+    echo -e "Current Target Host Port  : ${CYAN}${TCP_HOST_PORT:-2222}${NC}"
+    echo -e "Current Guest VM Port     : ${CYAN}${TCP_GUEST_PORT:-22}${NC}"
+    echo ""
+    echo -ne "${BLUE}🔹 Enter NEW External Host Port (Default base: 2222): ${NC}"
+    read NEW_HOST_PORT
+    TCP_HOST_PORT=${NEW_HOST_PORT:-2222}
 
-prepare_uefi(){
-  local pair code vars
-  pair=$(find_uefi || true)
-  [[ -n "$pair" ]] || return 1
-  code=${pair%%|*}; vars=${pair#*|}
-  if [[ ! -f "$VM_DIR/OVMF_VARS.fd" ]]; then
-    cp -- "$vars" "$VM_DIR/OVMF_VARS.fd"
-    chmod 600 "$VM_DIR/OVMF_VARS.fd"
-  fi
-  printf '%s\n' "$code"
-}
+    echo -ne "${BLUE}🔹 Enter Internal Guest Port (Default SSH: 22): ${NC}"
+    read NEW_GUEST_PORT
+    TCP_GUEST_PORT=${NEW_GUEST_PORT:-22}
 
-build_qemu_cmd(){
-  local ram="$1" cpus="$2" kvm_flag="$3" cpu_model
-  if [[ -n "${SUKUNA_QEMU_CPU_MODEL:-}" ]]; then
-    cpu_model="$SUKUNA_QEMU_CPU_MODEL"
-  elif [[ "$kvm_flag" == kvm ]]; then
-    cpu_model=host
-  else
-    cpu_model=max
-  fi
-  local -a qemu=(
-    "$QEMU_PATH"
-    -name "$VM_NAME"
-    -machine "q35,accel=${kvm_flag}"
-    -cpu "$cpu_model"
-    -smp "$cpus"
-    -m "${ram}M"
-    -nodefaults
-    -no-user-config
-    -display none
-    -serial "file:$CONSOLE_LOG"
-    -monitor none
-    -device virtio-rng-pci
-    -drive "if=virtio,format=qcow2,file=$DISK_IMG,cache=none,aio=threads"
-    -drive "if=virtio,format=raw,readonly=on,file=$SEED_ISO"
-    -netdev "user,id=n1,hostfwd=tcp:0.0.0.0:${HOST_SSH_PORT}-:22"
-    -device virtio-net-pci,netdev=n1
-    -qmp "unix:$QMP_SOCK,server=on,wait=off"
-    -pidfile "$PID_FILE"
-  )
-
-  local uefi
-  uefi=$(prepare_uefi || true)
-  if [[ -n "$uefi" ]]; then
-    qemu+=( -drive "if=pflash,format=raw,readonly=on,file=$uefi" \
-            -drive "if=pflash,format=raw,file=$VM_DIR/OVMF_VARS.fd" )
-  fi
-
-  printf '%q ' "${qemu[@]}"
-}
-
-start_vm(){
-  local ram="$1" cpus="$2" accel="$3"
-  : > "$QEMU_LOG"
-  : > "$CONSOLE_LOG"
-  rm -f -- "$PID_FILE" "$QMP_SOCK"
-
-  if ! port_free; then
-    die "Host TCP port $HOST_SSH_PORT is already in use. Set SUKUNA_SSH_PORT=<free-port>."
-  fi
-
-  local cmd
-  cmd=$(build_qemu_cmd "$ram" "$cpus" "$accel")
-  log "Starting QEMU with $ram MiB RAM / $cpus vCPU / accel=$accel ..."
-  bash -c "exec $cmd" >>"$QEMU_LOG" 2>&1 &
-  local launcher_pid=$!
-  disown "$launcher_pid" 2>/dev/null || true
-
-  local elapsed=0
-  while (( elapsed < BOOT_TIMEOUT )); do
-    if pid_running; then
-      ok 'QEMU process started and identity verified.'
-      return
-    fi
-    if ! kill -0 "$launcher_pid" 2>/dev/null && [[ ! -s "$PID_FILE" ]]; then
-      tail -n 40 "$QEMU_LOG" >&2 || true
-      die 'QEMU exited before its PID could be verified.'
-    fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  tail -n 60 "$QEMU_LOG" >&2 || true
-  die "QEMU did not become ready within ${BOOT_TIMEOUT}s."
-}
-
-wait_for_ssh(){
-  local elapsed=0
-  log "Waiting for guest SSH on port $HOST_SSH_PORT ..."
-  while (( elapsed < SSH_TIMEOUT )); do
-    if ! pid_running; then
-      tail -n 80 "$QEMU_LOG" >&2 || true
-      die 'QEMU stopped while waiting for guest SSH.'
-    fi
-    if bash -c "</dev/tcp/127.0.0.1/$HOST_SSH_PORT" >/dev/null 2>&1; then
-      ok "Guest SSH port is accepting TCP connections."
-      return
-    fi
+    save_env
+    echo ""
+    echo -e "${GREEN}✅ TCP Rule Updated Successfully! (Restart the VM for it to take effect)${NC}"
     sleep 2
-    ((elapsed+=2))
-  done
-  warn 'QEMU is running, but guest SSH did not open before timeout.'
-  warn 'Cloud-init may still be provisioning. Check console log: '
-  warn "$CONSOLE_LOG"
+    show_menu
 }
 
-print_result(){
-  local password
-  password=$(awk -F= '/^SUKUNA_VM_PASSWORD=/{print $2; exit}' "$RUN_DIR/credentials.txt")
-  local ip
-  ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  [[ -n "$ip" ]] || ip='YOUR_SERVER_IP'
-
-  printf '\n%b============================================================%b\n' "$CYAN" "$RESET"
-  printf '%b  SUKUNA V7 SERVER IS BOOTING / RUNNING%b\n' "$GREEN" "$RESET"
-  printf '%b============================================================%b\n' "$CYAN" "$RESET"
-  printf 'Host IP      : %s\n' "$ip"
-  printf 'SSH command  : ssh -p %s %s@%s\n' "$HOST_SSH_PORT" "$VM_USER" "$ip"
-  printf 'Password     : %s\n' "$password"
-  printf 'VM name      : %s\n' "$VM_NAME"
-  printf 'PID file     : %s\n' "$PID_FILE"
-  printf 'QEMU log     : %s\n' "$QEMU_LOG"
-  printf 'Console log  : %s\n' "$CONSOLE_LOG"
-  printf '\n%bImportant:%b the guest is reached through host port %s. Keep that port open in your VPS firewall/security group.\n' "$YELLOW" "$RESET" "$HOST_SSH_PORT"
-  printf '%b============================================================%b\n' "$CYAN" "$RESET"
+save_env() {
+    echo "RAM_GB=${RAM_GB:-32}" > .vps_env
+    echo "CPU_CORES=${CPU_CORES:-4}" >> .vps_env
+    echo "USER_NAME=${USER_NAME:-ubuntu}" >> .vps_env
+    # No hardcoded fallback here: USER_PASS is always set by create_vps
+    # (typed or auto-generated) before save_env ever runs. A hardcoded
+    # fallback here would silently reintroduce a weak default password.
+    echo "USER_PASS=${USER_PASS}" >> .vps_env
+    echo "TCP_HOST_PORT=${TCP_HOST_PORT:-2222}" >> .vps_env
+    echo "TCP_GUEST_PORT=${TCP_GUEST_PORT:-22}" >> .vps_env
+    chmod 600 .vps_env
 }
 
-main(){
-  printf '%bDXD LABS SUKUNA V7 BOOT EDITION%b\n' "$MAGENTA" "$RESET"
-  printf 'One-command Ubuntu 22.04 QEMU/KVM server bootstrap.\n\n'
-  require_root
-  validate_inputs
-  ensure_dependencies
-  ensure_python
-  safe_dirs
-  lock_instance
-  generate_credentials
-  prepare_base_image
-  prepare_guest_disk
-  prepare_cloud_init
-  create_seed_iso
-
-  read -r ram cpus < <(calc_resources)
-  local accel='tcg'
-  if kvm_ok; then
-    accel='kvm'
-    ok 'Hardware KVM is available.'
-  else
-    warn 'Hardware KVM is unavailable; falling back to QEMU TCG.'
-  fi
-
-  if pid_running; then
-    ok 'SUKUNA VM is already running.'
-  else
-    start_vm "$ram" "$cpus" "$accel"
-  fi
-  wait_for_ssh
-  print_result
-  trap - EXIT
+# Capture the sshx share link from whatever the VM-console tmux pane has printed
+capture_sshx_link() {
+    tmux capture-pane -t "${TMUX_SESSION}:${VM_WINDOW}" -p -S -300 2>/dev/null \
+        | grep -Eo 'https://sshx\.io/s[/#][A-Za-z0-9,]+' \
+        | head -n 1
 }
 
-main "$@"
+show_sshx_link() {
+    clear
+    SSHX_URL=$(capture_sshx_link)
+    if [ -n "$SSHX_URL" ]; then
+        echo -e "${GREEN}👉 $SSHX_URL 👈${NC}"
+    else
+        echo -e "${RED}⚠️ No active sshx link found. It may still be starting, or the VM session isn't running.${NC}"
+    fi
+    echo ""
+    read -p "Press Enter to return to the menu..."
+    show_menu
+}
+
+# STEP 3: BOOT QEMU *INSIDE* THE SAME PTY THAT SSHX SHARES
+# ------------------------------------------------------------------
+# Design:
+#   - A detached tmux session survives your terminal/SSH connection closing,
+#     because the tmux server runs independently of your login shell.
+#   - Window "vm-console" launches sshx. sshx spawns its own shared pty and
+#     mirrors it to sshx.io over an outbound HTTPS/WebSocket connection.
+#     Once that shared shell is live, we type the qemu boot command straight
+#     into it with `tmux send-keys` -- so the sshx link shows the VM's own
+#     boot console / login prompt, NOT your host shell.
+#   - Because that login happens on the VM's serial console (via
+#     qemu -nographic), it needs no network SSH at all. So even if the
+#     sandbox/firewall blocks outbound or inbound SSH traffic, you can still
+#     reach and log into the VM through the sshx web link.
+#   - Window "host-shell" is a private plain shell for you to manage the
+#     host. It is never exposed through the sshx link (sshx only shares the
+#     pane it was launched in), so it's only reachable via a local
+#     `tmux attach`.
+# ------------------------------------------------------------------
+boot_qemu() {
+    if [ -f ".vps_env" ]; then
+        source .vps_env
+    fi
+
+    TCP_HOST_PORT=${TCP_HOST_PORT:-2222}
+    TCP_GUEST_PORT=${TCP_GUEST_PORT:-22}
+    RAM_VALUE="${RAM_GB:-32}G"
+
+    clear
+    echo -e "${GREEN}==========================================================${NC}"
+    type_effect "👹 DATA SYSTEM SYNCHRONIZED! PIPING TERMINAL CHANNELS..." 0.02
+    echo -e "${GREEN}==========================================================${NC}"
+    echo ""
+
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo -e "${YELLOW}⚠️ A VM session is already running in tmux (${TMUX_SESSION}). Killing it before restart...${NC}"
+        tmux kill-session -t "$TMUX_SESSION"
+    fi
+
+    QEMU_CMD="qemu-system-x86_64 -hda /home/daytona/ubuntu22.qcow2 -m $RAM_VALUE -smp ${CPU_CORES:-4} -drive file=seed.img,format=raw -nographic -netdev user,id=net0,hostfwd=tcp::${TCP_HOST_PORT}-:${TCP_GUEST_PORT} -device e1000,netdev=net0"
+
+    # Window 0: vm-console, running sshx (this becomes the shared VM console)
+    tmux new-session -d -s "$TMUX_SESSION" -n "$VM_WINDOW" -x 220 -y 50 \
+        "bash -c 'curl -sSf https://sshx.io/get | sh -s run'"
+
+    # Window 1: host-shell, private, never shared over sshx
+    tmux new-window -t "$TMUX_SESSION" -n "$HOST_WINDOW"
+
+    echo -e "${YELLOW}⏳ Waiting for sshx tunnel to come up...${NC}"
+    SSHX_URL=""
+    for i in $(seq 1 25); do
+        SSHX_URL=$(capture_sshx_link)
+        [ -n "$SSHX_URL" ] && break
+        sleep 1
+    done
+
+    if [ -n "$SSHX_URL" ]; then
+        # Give sshx's inner shared shell a moment to become interactive,
+        # then type the qemu boot command directly into it.
+        sleep 2
+        tmux send-keys -t "${TMUX_SESSION}:${VM_WINDOW}" "clear; $QEMU_CMD" C-m
+    else
+        echo -e "${RED}⚠️ sshx link did not appear in time. Launching qemu anyway inside the tmux window -- check option [6] shortly.${NC}"
+        tmux send-keys -t "${TMUX_SESSION}:${VM_WINDOW}" "clear; $QEMU_CMD" C-m
+    fi
+
+    clear
+    echo -e "${GREEN}==========================================================${NC}"
+    echo -e "🎉       DEUP GAMING & DXD LABS - VM NETWORK ACTIVE        "
+    echo -e "${GREEN}==========================================================${NC}"
+    echo -e "${WHITE}👤 Username : ${CYAN}${USER_NAME:-ubuntu}${NC}"
+    echo -e "${WHITE}🔑 Password : ${CYAN}${USER_PASS}${NC}"
+    echo -e "${WHITE}⚙️  Resources: ${CYAN}${RAM_VALUE} RAM | ${CPU_CORES:-4} Cores${NC}"
+    echo -e "${WHITE}🚀 Port Rule : ${YELLOW}Host Port ${TCP_HOST_PORT} -> VM Port ${TCP_GUEST_PORT}${NC}"
+    echo -e "${RED}----------------------------------------------------------${NC}"
+    if [ -n "$SSHX_URL" ]; then
+        echo -e "${YELLOW}🔥 VM CONSOLE LINK (works even if SSH is blocked -- log in with the${NC}"
+        echo -e "${YELLOW}   username/password above, right at the console):${NC}"
+        echo -e "${GREEN}👉 $SSHX_URL 👈${NC}"
+    else
+        echo -e "${RED}⚠️ Tunnel still starting. Use menu option [6] to check for the link again.${NC}"
+    fi
+    echo -e "${RED}----------------------------------------------------------${NC}"
+    echo -e "${WHITE}👉 Network SSH (if unblocked) : ssh ${USER_NAME:-ubuntu}@localhost -p ${TCP_HOST_PORT}${NC}"
+    echo -e "${WHITE}👉 Local console attach       : tmux attach -t ${TMUX_SESSION}${NC}"
+    echo -e "${CYAN}   (Ctrl+b then w to switch windows, Ctrl+b then d to detach -- nothing stops)${NC}"
+    echo -e "${GREEN}==========================================================${NC}"
+    echo ""
+    read -p "Press Enter to return to the menu (the VM and tunnel keep running in the background)..."
+    show_menu
+}
+
+# ATTACH LOCALLY TO EITHER THE VM CONSOLE OR THE PRIVATE HOST SHELL
+attach_local() {
+    clear
+    if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        echo -e "${RED}❌ No running VM session found. Build one with Option 1 first.${NC}"
+        sleep 2
+        show_menu
+        return
+    fi
+    echo -e "  ${CYAN}[1]${NC} VM console (same view the sshx link shows)"
+    echo -e "  ${CYAN}[2]${NC} Private host shell (not exposed via sshx)"
+    echo -ne "${WHITE}🔹 Choice: ${NC}"
+    read ATTACH_CHOICE
+    echo -e "${GREEN}(Ctrl+b then d to detach without stopping anything)${NC}"
+    sleep 1
+    case "$ATTACH_CHOICE" in
+        2) tmux attach -t "${TMUX_SESSION}:${HOST_WINDOW}" ;;
+        *) tmux attach -t "${TMUX_SESSION}:${VM_WINDOW}" ;;
+    esac
+    show_menu
+}
+
+# RESTART PIPELINE
+restart_vps() {
+    if [ -f "/home/daytona/ubuntu22.qcow2" ] && [ -f "seed.img" ]; then
+        echo -e "${GREEN}🔄 Restarting existing server architecture...${NC}"
+        sleep 1
+        boot_qemu
+    else
+        echo -e "${RED}❌ No active configuration blocks found! Build module using Option 1.${NC}"
+        sleep 3
+        show_menu
+    fi
+}
+
+# CLEAN PIPELINE
+clean_vps() {
+    echo -e "${RED}⚠️ Purging system storage components and configurations...${NC}"
+    if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+        tmux kill-session -t "$TMUX_SESSION"
+    fi
+    $SUDO_CMD rm -rf user-data seed.img /home/daytona/ubuntu22.qcow2 .vps_env
+    # BUGFIX: the running sshx client process doesn't necessarily have
+    # "sshx.io" in its command line (it's a locally re-exec'd binary), so
+    # the old pkill pattern usually matched nothing. tmux kill-session
+    # above already reaps it as part of the pane's process tree; this is
+    # just a best-effort backstop for anything left outside tmux.
+    pkill -f "sshx" > /dev/null 2>&1
+    sleep 1
+    echo -e "${GREEN}✅ Workspace successfully wiped fresh!${NC}"
+    sleep 2
+    show_menu
+}
+
+# EXECUTE TRIGGER
+show_menu
