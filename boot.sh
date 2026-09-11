@@ -218,9 +218,15 @@ save_env() {
 }
 
 # Capture the sshx share link from whatever the VM-console tmux pane has printed
+# BUGFIX: sshx links look like https://sshx.io/s/<ID>#<KEY> -- the security
+# key after "#" is required to actually open the session. The previous regex
+# used a character class that didn't include "#", so it truncated the link
+# right before the key and produced a broken URL. Grabbing everything up to
+# the next whitespace avoids guessing at the charset and keeps the whole
+# link -- ID, "#", and KEY -- intact, regardless of format changes.
 capture_sshx_link() {
     tmux capture-pane -t "${TMUX_SESSION}:${VM_WINDOW}" -p -S -300 2>/dev/null \
-        | grep -Eo 'https://sshx\.io/s[/#][A-Za-z0-9,]+' \
+        | grep -Eo 'https://sshx\.io/s/[^[:space:]]+' \
         | head -n 1
 }
 
